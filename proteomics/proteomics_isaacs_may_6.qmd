@@ -1,0 +1,970 @@
+```{r}
+# Core tidyverse: includes dplyr, ggplot2, readr, tibble, etc.
+library(tidyverse)
+library(purrr)
+
+# Cleaning and input tools
+library(janitor)       # For cleaning column names
+library(readxl)        # To read .xlsx files
+
+# Lipidomics tools
+library(LipidSigR)     # Main analysis package
+library(rgoslin)       # Lipid name parser
+
+# Supporting packages
+library(SummarizedExperiment)  # Core data container
+library(ggrepel)               # Non-overlapping plot labels
+library(broom)                 # Clean test output
+library(car)                   # For Levene’s test (equal variances)
+```
+
+# Read the proteomics csv
+
+```{r}
+matrix_all <- read.csv("matrix_proteomics_isaac.csv") %>% janitor::clean_names() %>%  mutate(gene = if_else(entry_name == "YJ005_HUMAN", "FLJ45252", gene))
+
+matrix_human <- matrix_all %>%
+  filter(organism == "Homo sapiens")
+
+dups_after_filtering <- matrix_human$gene[duplicated(matrix_human$gene) & !is.na(matrix_human$gene)]
+length(unique(dups_after_filtering))
+
+dups_after_filtering
+
+duplicated_gene_rows <- matrix_human %>%
+  filter(gene %in% dups_after_filtering)
+
+
+duplicated_gene_rows
+```
+
+
+
+# Data dict
+```{r}
+samples_proteins <- read.csv("rnaseq_dictionary_Isaacs.csv")
+```
+
+
+```{r}
+
+# Create mapping of intensity column names to sample names
+intensity_map <- tibble::tibble(
+  colname = c(
+    "m_witkowski4574840_iv01_intensity",  # IV1
+    "m_wikkowski4574840_iv02_intensity",  # IV2
+    "m_wikkowski4574840_iv03_intensity",  # IV3
+    "m_wikkowski4574840_iv04_intensity",  # IV4
+    "m_wikkowski4574840_iv05_intensity",  # IV5
+    "m_wikkowski4574840_iv06_intensity",  # IV6
+    "m_wikkowski4574840_iv07_intensity",  # IV7
+    "m_wikkowski4574840_iv08_intensity",  # IV8
+    "m_witkowski4574840_iv09_intensity",  # IV9
+    "m_witkowski4574840_iv10_intensity",  # IV10
+    "m_wikkowski4574840_iv11_intensity",  # IV11
+    "m_witkowski4574840_iv12_intensity",  # IV12
+    "m_witkowski4574840_iv13_intensity",  # IV13
+    "m_witkowski4574840_iv15_intensity",  # IV14
+    "m_witkowski4574840_iv16_intensity",  # IV15
+    "m_wikkowski4574840_iv26_intensity",  # IV16
+    "m_witkowski4574840_iv27_intensity",  # IV17
+    "m_wikkowski4574840_iv014_intensity"  # IV18
+  ),
+  Sample = samples_proteins$Sample,
+  Sensitivity.group = samples_proteins$Sensitivity.group,
+  Cell.type = samples_proteins$Cell.type
+) %>% filter(Sensitivity.group != "High")
+
+
+```
+
+
+```{r}
+# Step 1: Define renaming logic for the specific protein isoforms
+matrix_human <- matrix_human %>%
+  mutate(
+    gene = case_when(
+      protein_id == "P0DI83" ~ "RAB34_NARR_198",
+      protein_id == "Q9BZG1" ~ "RAB34_259",
+      protein_id == "P42166" ~ "TMPO_alpha_694",
+      protein_id == "P42167" ~ "TMPO_beta_gamma_454",
+      TRUE ~ gene
+    )
+  )
+
+```
+
+```{r}
+# Recreate the matrix with renamed genes (now unique)
+intensity_matrix <- matrix_human %>%
+  dplyr::select(gene, all_of(intensity_map$colname)) %>%
+  filter(!is.na(gene)) %>%
+  group_by(gene) %>%
+  summarise(across(everything(), sum), .groups = "drop") %>%
+  column_to_rownames("gene")
+
+# Rename columns to sample names (IV1–IV18)
+colnames(intensity_matrix) <- intensity_map$Sample
+
+
+# Create a logical matrix: TRUE if expression > 0
+expr_mat <- intensity_matrix > 0
+
+# Get mapping of samples to cell lines
+cell_line_map <- setNames(intensity_map$Cell.type, intensity_map$Sample)
+
+# For each protein, determine the number of cell lines with ≥2 expressed replicates
+keep_proteins <- apply(expr_mat, 1, function(row_expr) {
+  # Get sample names where expression is > 0
+  expressed_samples <- names(row_expr)[row_expr]
+  # Get cell types corresponding to those samples
+  expressed_cell_types <- cell_line_map[expressed_samples]
+  # Count how many samples per cell type
+  sample_counts <- table(expressed_cell_types)
+  # Return TRUE if any cell type has ≥2 expressed samples
+  any(sample_counts >= 2)
+})
+
+# Apply filter
+intensity_matrix <- intensity_matrix[keep_proteins, ]
+
+
+
+```
+
+
+# Try quantile normalization
+
+```{r}
+library(preprocessCore)
+library(ggplot2)
+
+# ---------------------------
+# Step 1: Extract group info
+# ---------------------------
+sample_groups <- setNames(intensity_map$Sensitivity.group, intensity_map$Sample)
+
+# Ensure column order of intensity_matrix matches intensity_map$Sample
+intensity_matrix <- intensity_matrix[, intensity_map$Sample]
+
+# ---------------------------
+# Step 2: Log2-transform BEFORE normalization
+# ---------------------------
+log2_matrix <- log2(intensity_matrix + 1)
+
+# Identify and exclude zero-variance proteins
+protein_variances <- apply(log2_matrix, 1, var)
+nonzero_variance_idx <- which(protein_variances > 1e-8)
+log2_matrix_filtered <- log2_matrix[nonzero_variance_idx, ]
+
+# ---------------------------
+# Step 3: PCA before normalization
+# ---------------------------
+pca_raw <- prcomp(t(log2_matrix_filtered), scale. = TRUE)
+autoplot_raw <- ggplot(as.data.frame(pca_raw$x), aes(
+  x = PC1, y = PC2,
+  label = intensity_map$Cell.type[match(rownames(pca_raw$x), intensity_map$Sample)]
+)) +
+  geom_point(aes(color = sample_groups[rownames(pca_raw$x)]), size = 3) +
+  geom_text(hjust = 1.2, vjust = 1.2, size = 3) +
+  labs(title = "PCA Before Class-Specific Quantile Normalization", color = "Group") +
+  theme_minimal()
+
+# ---------------------------
+# Step 4: Class-specific Quantile Normalization ON LOG2 values
+# ---------------------------
+qn_log2_matrix <- log2_matrix  # initialize copy
+for (grp in unique(sample_groups)) {
+  grp_samples <- names(sample_groups)[sample_groups == grp]
+  mat_grp <- as.matrix(log2_matrix[, grp_samples])
+  qn_log2_matrix[, grp_samples] <- normalize.quantiles(mat_grp)
+}
+colnames(qn_log2_matrix) <- colnames(log2_matrix)
+rownames(qn_log2_matrix) <- rownames(log2_matrix)
+
+log2_qn <- qn_log2_matrix
+
+# ---------------------------
+# Step 5: PCA after normalization
+# ---------------------------
+var_qn <- apply(qn_log2_matrix, 1, var)
+qn_log2_filtered <- qn_log2_matrix[var_qn > 1e-8, ]
+
+pca_qn <- prcomp(t(qn_log2_filtered), scale. = TRUE)
+autoplot_qn <- ggplot(as.data.frame(pca_qn$x), aes(
+  x = PC1, y = PC2,
+  label = intensity_map$Cell.type[match(rownames(pca_qn$x), intensity_map$Sample)]
+)) +
+  geom_point(aes(color = sample_groups[rownames(pca_qn$x)]), size = 3) +
+  geom_text(hjust = 1.2, vjust = 1.2, size = 3) +
+  labs(title = "PCA After Class-Specific Quantile Normalization (log2)", color = "Group") +
+  theme_minimal()
+
+# ---------------------------
+# Step 6: Plot both PCAs
+# ---------------------------
+print(autoplot_raw)
+print(autoplot_qn)
+
+
+```
+
+# Scaling and zscoring
+
+```{r}
+# Already done: class-specific quantile normalization → qn_matrix
+
+# Log2-transform and convert to log10 scale
+# Use the existing log2-normalized matrix from class-specific quantile normalization
+log10_qn <- log2_qn / log2(10)
+
+# Z-score per protein (mean 0, sd 1)
+scaled_data <- t(scale(t(log10_qn)))  # mean center + divide by SD
+
+```
+
+```{r}
+# Run PCA
+pca_scaled <- prcomp(t(scaled_data), scale. = FALSE)  # already scaled!
+
+# Plot PCA
+pca_df <- as.data.frame(pca_scaled$x)
+pca_df$Sample <- rownames(pca_df)
+pca_df$CellType <- intensity_map$Cell.type[match(pca_df$Sample, intensity_map$Sample)]
+pca_df$Group <- intensity_map$Sensitivity.group[match(pca_df$Sample, intensity_map$Sample)]
+
+ggplot(pca_df, aes(PC1, PC2, color = Group, label = CellType)) +
+  geom_point(size = 3) +
+  geom_text(hjust = 1.2, vjust = 1.2, size = 3) +
+  labs(title = "PCA After Normalization, Log10 Transformation, and Scaling") +
+  theme_minimal()
+
+```
+
+# Q-Q plot
+
+## Running limma
+```{r}
+# Only do this if using raw intensities
+log2_matrix <- log2(intensity_matrix + 1)
+
+# Confirm sample order
+stopifnot(all(colnames(log2_matrix) == intensity_map$Sample))
+
+# Design matrix
+group <- factor(intensity_map$Sensitivity.group, levels = c("Low", "Medium"))
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)
+
+# limma analysis
+library(limma)
+fit <- lmFit(log2_matrix, design)
+contrast_matrix <- makeContrasts(Medium_vs_Low = Medium - Low, levels = design)
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2, trend = TRUE)  # recommended for proteomics
+
+# Extract results
+de_results <- topTable(fit2, coef = "Medium_vs_Low", number = Inf, adjust.method = "fdr") %>%
+  rownames_to_column("Protein") %>%
+  mutate(FoldChange = 2^logFC)
+
+head(de_results)
+
+```
+# Volcano plot
+
+```{r}
+# 🎨 Visual styling
+cols <- c("up" = "#ffad73", "down" = "#26b3ff", "ns" = "grey")
+sizes <- c("up" = 2, "down" = 2, "ns" = 1)
+alphas <- c("up" = 1, "down" = 1, "ns" = 0.5)
+
+# 🔧 Annotate volcano data (using log2FC directly)
+volcano_data <- de_results %>%
+  drop_na() %>%
+  dplyr::select(
+    GeneSymbol = Protein,
+    log2FC = logFC,
+    PValue = P.Value
+  ) %>%
+  mutate(
+    GeneType = case_when(
+      log2FC >= 1 & PValue <= 0.05 ~ "up",
+      log2FC <= -1 & PValue <= 0.05 ~ "down",
+      TRUE ~ "ns"
+    )
+  )
+
+# 📈 Volcano plot using log2FC (no transformation to FC)
+p <- ggplot(volcano_data, aes(
+  x = log2FC,
+  y = -log10(PValue),
+  fill = GeneType,
+  size = GeneType,
+  alpha = GeneType
+)) +
+  geom_point(shape = 21, color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "gray40") +
+  scale_fill_manual(values = cols, name = "Regulation") +
+  scale_size_manual(values = sizes, guide = "none") +
+  scale_alpha_manual(values = alphas, guide = "none") +
+  labs(
+    title = "Proteomics Volcano Plot (Medium vs Low)",
+    subtitle = "Threshold: log2FC ≥ 1 or ≤ -1 & p ≤ 0.05",
+    x = "log2(Fold Change) (Medium / Low)",
+    y = "-log10(p-value)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    legend.position = "right"
+  )
+
+# 🧬 Add gene labels for significant hits
+p + ggrepel::geom_text_repel(
+  data = filter(volcano_data, GeneType != "ns"),
+  aes(label = GeneSymbol),
+  size = 3.5,
+  color = "darkblue",
+  max.overlaps = 10,
+  box.padding = 0.4,
+  point.padding = 0.3,
+  segment.size = 0.3
+)
+
+```
+# Just plot the genes for either the secretome or cell surface, so produce 2 volcanoes
+
+## ✅ GSEA: Cell Surface Gene Set
+```{r}
+# --- Required Libraries ---
+library(fgsea)
+library(org.Hs.eg.db)
+library(msigdbr)
+library(tidyverse)
+
+# --- 1. Prepare the Cell Surface Gene Set ---
+gocc_cell_surface <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "CC") %>%
+  filter(gs_name == "GOCC_CELL_SURFACE") %>%
+  distinct(gs_name, gene_symbol) %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# --- 2. Prepare ranked protein list (logFC named by gene symbol) ---
+gene_ranks <- de_results %>%
+  filter(!is.na(logFC)) %>%
+  distinct(Protein, .keep_all = TRUE) %>%
+  arrange(desc(logFC)) %>%
+  pull(logFC, name = Protein)
+
+# --- 3. Run fgsea for the GOCC_CELL_SURFACE gene set ---
+fgsea_surface <- fgsea(
+  pathways = gocc_cell_surface,
+  stats = gene_ranks,
+  nperm = 10000
+)
+
+# --- 4. Dynamically determine direction and plot ---
+surface_nes <- fgsea_surface$NES[1]
+surface_direction <- ifelse(surface_nes > 0, "Enriched in Medium", "Enriched in Low")
+
+surface_plot <- plotEnrichment(
+  gocc_cell_surface[[1]],
+  stats = gene_ranks
+) +
+  labs(
+    title = "GSEA Enrichment: Cell Surface GO",
+    subtitle = paste0("Medium vs Low Sensitivity\n", surface_direction),
+    x = "Ranked Proteins (logFC)",
+    y = "Enrichment Score"
+  ) +
+  annotate("text", x = -Inf, y = -Inf, hjust = -0.1, vjust = -0.5,
+           label = surface_direction, size = 4, fontface = "italic", color = "gray30") +
+  theme_minimal(base_size = 13)
+
+```
+## ✅ GSEA: Secretome Gene Set
+
+## Secretome enrichment
+
+```{r}
+# --- 1. Load secretome file ---
+secretome_file <- readxl::read_xlsx("../rnaseq/aaz0274_data_file_s2.xlsx") %>% 
+    janitor::clean_names()
+
+# --- 2. Filter for "Secreted" proteins and get gene symbols from 'gene_name' ---
+secretome_genes <- secretome_file %>%
+    filter(grepl("Secreted", annotated_category)) %>%
+    pull(gene_name) %>%
+    unique()
+
+# --- 3. Build gene set object for fgsea ---
+secretome_set <- list("Human Secretome" = secretome_genes)
+
+# --- 4. Reuse your existing gene_ranks built from Protein names ---
+# (assumes 'gene_ranks' was created like this:)
+# gene_ranks <- de_results %>%
+#   filter(!is.na(logFC)) %>%
+#   distinct(Protein, .keep_all = TRUE) %>%
+#   arrange(desc(logFC)) %>%
+#   pull(logFC, name = Protein)
+
+# --- 5. Run fgseaMultilevel ---
+fgsea_secretome <- fgseaMultilevel(
+    pathways = secretome_set,
+    stats = gene_ranks
+)
+
+# --- 6. Plot with dynamic enrichment direction ---
+secretome_nes <- fgsea_secretome$NES[1]
+secretome_direction <- ifelse(secretome_nes > 0, "Enriched in Medium", "Enriched in Low")
+
+secretome_plot <- plotEnrichment(
+    secretome_set[[1]],
+    stats = gene_ranks
+) +
+    labs(
+        title = "GSEA Enrichment: Human Secretome Genes",
+        subtitle = paste0("Medium vs Low Sensitivity\n", secretome_direction),
+        x = "Ranked Proteins (logFC: Medium / Low)",
+        y = "Enrichment Score"
+    ) +
+    annotate("text", x = -Inf, y = -Inf, hjust = -0.1, vjust = -0.5,
+             label = "Enriched in Medium →", size = 4, fontface = "italic", color = "gray30") +
+    annotate("text", x = Inf, y = -Inf, hjust = 1.2, vjust = -0.5,
+             label = "← Enriched in Low", size = 4, fontface = "italic", color = "gray30") +
+    theme_minimal(base_size = 13)
+
+# --- 7. Print plot ---
+print(secretome_plot)
+```
+## Intrinsic apoptotic GSEA
+```{r}
+# Load required libraries
+library(msigdbr)
+library(fgsea)
+library(ggplot2)
+library(dplyr)
+
+# ✅ Get intrinsic apoptosis gene set (symbols)
+intrinsic_pathway <- msigdbr(
+  species = "Homo sapiens",
+  category = "C2",
+  subcategory = "CP:REACTOME"
+) %>%
+  filter(gs_name == "REACTOME_INTRINSIC_PATHWAY_FOR_APOPTOSIS") %>%
+  pull(gene_symbol) %>%
+  unique()
+
+# ✅ Format as list for fgsea
+intrinsic_set <- list("REACTOME_INTRINSIC_PATHWAY_FOR_APOPTOSIS" = intrinsic_pathway)
+
+# ✅ Run GSEA (assuming `gene_ranks` uses gene symbols)
+fgsea_intrinsic <- fgseaMultilevel(
+  pathways = intrinsic_set,
+  stats = gene_ranks
+)
+
+# ✅ Plot
+intrinsic_plot <- plotEnrichment(
+  intrinsic_set[[1]],
+  stats = gene_ranks
+) +
+  labs(
+    title = "GSEA Enrichment: Intrinsic Apoptosis",
+    subtitle = "Medium vs Low Sensitivity (Proteomics)",
+    x = "Ranked Proteins (log2FC)",
+    y = "Enrichment Score"
+  ) +
+  annotate("text", x = -Inf, y = -Inf, hjust = -0.1, vjust = -0.5,
+           label = "Enriched in Medium →", size = 4, fontface = "italic", color = "gray30") +
+  annotate("text", x = Inf, y = -Inf, hjust = 1.2, vjust = -0.5,
+           label = "← Enriched in Low", size = 4, fontface = "italic", color = "gray30") +
+  theme_minimal(base_size = 13)
+
+# Print
+print(intrinsic_plot)
+```
+
+## Extrinsic apoptotic GSEA
+```{r}
+# ✅ Define the extrinsic pathway using HGNC gene symbols
+extrinsic_genes <- c(
+  "FAS", "FASLG", "TNF", "TNFRSF1A", "TRAF2",
+  "CASP8", "CASP10", "TRADD", "RIPK1", "TNFSF10",
+  "FADD", "TNFRSF10B", "CFLAR"
+)
+
+# ✅ Format into a named list
+extrinsic_set <- list("REACTOME_EXTRINSIC_PATHWAY_FOR_APOPTOSIS" = extrinsic_genes)
+
+# ✅ Run GSEA using fgseaMultilevel (assuming gene_ranks is named by gene symbols)
+fgsea_extrinsic <- fgseaMultilevel(
+  pathways = extrinsic_set,
+  stats = gene_ranks
+)
+
+# ✅ Plot the enrichment
+extrinsic_plot <- plotEnrichment(
+  extrinsic_set[[1]],
+  stats = gene_ranks
+) +
+  labs(
+    title = "GSEA Enrichment: Extrinsic Apoptosis",
+    subtitle = "Medium vs Low Sensitivity (Proteomics)",
+    x = "Ranked Proteins (log2FC)",
+    y = "Enrichment Score"
+  ) +
+  annotate("text", x = -Inf, y = -Inf, hjust = -0.1, vjust = -0.5,
+           label = "Enriched in Medium →", size = 4, fontface = "italic", color = "gray30") +
+  annotate("text", x = Inf, y = -Inf, hjust = 1.2, vjust = -0.5,
+           label = "← Enriched in Low", size = 4, fontface = "italic", color = "gray30") +
+  theme_minimal(base_size = 13)
+
+# ✅ Show plot
+print(extrinsic_plot)
+```
+
+
+# Mat s plot
+
+```{r}
+# Load RNA-seq results
+rnaseq_df <- read.csv("/Users/cojulian/Desktop/Tzu_projects/Matt/Isaac/multiomics/proteomics/de_results_rnaseq_Med_vs_Low.csv")
+
+# Load proteomics limma results (assuming it's already in your workspace as de_results)
+# If saved separately, load it like this:
+# proteomics_df <- read.csv("/your/path/to/limma_de_results.csv")
+
+# Rename for clarity
+library(org.Hs.eg.db)
+
+# Add gene symbol to rnaseq_df using Ensembl ID
+rnaseq_df <- rnaseq_df %>%
+  dplyr::mutate(
+    gene_symbol = mapIds(
+      org.Hs.eg.db,
+      keys = gene_id,
+      column = "SYMBOL",
+      keytype = "ENSEMBL",
+      multiVals = "first"
+    )
+  ) %>%
+  dplyr::filter(!is.na(gene_symbol))
+
+
+# Thresholds
+log2_fc_upper <- 1
+log2_fc_lower <- -1
+
+pval_threshold <- 0.1
+
+# Annotate proteomics significance
+proteomics_df <- de_results %>%
+  dplyr::select(Protein, logFC, P.Value) %>%
+  dplyr::rename(
+    gene_symbol = Protein,
+    MS_log2FC = logFC,
+    pvalue = P.Value
+  ) %>%
+  dplyr::mutate(
+    GeneType = case_when(
+      pvalue <= pval_threshold & MS_log2FC >= log2_fc_upper ~ "up",
+      pvalue <= pval_threshold & MS_log2FC <= log2_fc_lower ~ "down",
+      TRUE ~ "ns"
+    )
+  )
+
+# Preview
+head(proteomics_df)
+
+
+# Join by gene symbol or ID (whichever is shared)
+# Join using gene symbols now
+merged_df <- inner_join(
+  rnaseq_df %>% dplyr::select(gene_symbol, RNA_log2FC = log2FoldChange, RNA_GeneType = GeneType),
+  proteomics_df %>% dplyr::select(gene_symbol, MS_log2FC, MS_GeneType = GeneType),
+  by = "gene_symbol"
+)
+
+```
+
+# All sig genes
+
+```{r}
+# Filter genes that are significant in RNA or Proteomics
+all_sig <- merged_df %>%
+  filter(RNA_GeneType != "ns" | MS_GeneType != "ns")
+
+library(ggplot2)
+
+# Define quadrant plot
+all_sig_plot <- ggplot(all_sig, aes(x = RNA_log2FC, y = MS_log2FC)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_point(color = "black", size = 2.2, alpha = 0.7) +
+  labs(
+    title = "Quadrant Plot: All Significant Genes",
+    subtitle = "RNA-seq vs Proteomics (log2FC: Medium vs Low)",
+    x = "RNA-seq log2FC",
+    y = "Proteomics log2FC"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+
+# Show plot
+print(all_sig_plot)
+
+
+```
+
+
+## ✅ Filter for Secretome genes
+
+```{r}
+# Filter to secretome genes (already defined as secretome_genes)
+merged_secretome <- merged_df %>%
+  filter(gene_symbol %in% secretome_genes)
+
+secretome_both_plot <- ggplot(merged_secretome, aes(x = RNA_log2FC, y = MS_log2FC)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_point(color = "#9B59B6", size = 2, alpha = 0.7) +
+  labs(
+    title = "Quadrant Plot: Secretome Genes",
+    subtitle = "RNA-seq vs Proteomics (log2FC: Medium vs Low)",
+    x = "RNA-seq log2FC",
+    y = "Proteomics log2FC"
+  ) +
+  theme_minimal(base_size = 14)
+
+```
+
+## ✅ Filter for Cell Surface genes
+```{r}
+# Get list of cell surface genes from msigdbr
+cell_surface_genes <- gocc_cell_surface[[1]]
+
+# Filter
+merged_cell_surface <- merged_df %>%
+  filter(gene_symbol %in% cell_surface_genes)
+
+```
+
+```{r}
+cs_both_plot <- ggplot(merged_cell_surface %>% 
+                         filter(MS_GeneType != "ns"), aes(x = RNA_log2FC, y = MS_log2FC)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_point(color = "#3498DB", size = 2, alpha = 0.7) +
+  labs(
+    title = "Quadrant Plot: Cell Surface Genes",
+    subtitle = "RNA-seq vs Proteomics (log2FC: Medium vs Low)",
+    x = "RNA-seq log2FC",
+    y = "Proteomics log2FC"
+  ) +
+  theme_minimal(base_size = 14)
+```
+# Make sure I am using -1 and +1 for both datasets, but we do not care about RNAseq significance
+ 
+#Redo this but putting massspec only signifcant show them in blue, all remaining in gray
+
+
+
+```{r}
+# ✅ Step 1: Define apoptosis gene sets (by symbol)
+apoptosis_extrinsic <- c("FAS", "FASLG", "TNF", "TNFRSF1A", "TRAF2",
+                         "CASP8", "CASP10", "TRADD", "RIPK1", "TNFSF10",
+                         "FADD", "TNFRSF10B", "CFLAR")
+
+apoptosis_intrinsic <- reactome_sets[["REACTOME_INTRINSIC_PATHWAY_FOR_APOPTOSIS"]]
+
+# ✅ Step 2: Annotate gene sets
+plot_df <- merged_df %>%
+  filter(MS_GeneType != "ns") %>%
+  mutate(
+    GeneSet = case_when(
+      gene_symbol %in% secretome_genes ~ "Secretome",
+      gene_symbol %in% gocc_cell_surface[[1]] ~ "Cell Surface",
+      gene_symbol %in% apoptosis_extrinsic ~ "Apoptosis (Extrinsic)",
+      TRUE ~ "Other"
+    )
+  )
+
+# ✅ Step 3: Define colors
+gene_colors <- c(
+  "Secretome" = "#9B59B6",              # purple
+  "Cell Surface" = "#3498DB",           # blue
+  "Apoptosis (Intrinsic)" = "#E67E22",  # orange
+  "Apoptosis (Extrinsic)" = "#2ECC71",  # green
+  "Other" = "gray70"
+)
+
+# ✅ Step 4: Split layers
+gray_points <- plot_df %>% filter(GeneSet == "Other")
+colored_points <- plot_df %>% filter(GeneSet != "Other")
+
+# ✅ Step 5: Plot
+combined_gene_sets_plot <- ggplot() +
+  # Background gray points
+  geom_point(data = gray_points, aes(x = RNA_log2FC, y = MS_log2FC),
+             color = gene_colors["Other"], size = 2, alpha = 0.4) +
+
+  # Foreground colored points
+  geom_point(data = colored_points, aes(x = RNA_log2FC, y = MS_log2FC, color = GeneSet),
+             size = 2.5, alpha = 0.8) +
+
+  # Labels
+  ggrepel::geom_text_repel(
+    data = colored_points,
+    aes(x = RNA_log2FC, y = MS_log2FC, label = gene_symbol),
+    size = 3.5,
+    max.overlaps = 15,
+    segment.color = "gray50",
+    box.padding = 0.4,
+    point.padding = 0.3
+  ) +
+
+  # Quadrant guides
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray60") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+
+  # Axis limits and tick marks
+  scale_x_continuous(limits = c(-12, 12), breaks = seq(-12, 12, by = 2)) +
+  scale_y_continuous(limits = c(-12, 12), breaks = seq(-12, 12, by = 2)) +
+  scale_color_manual(values = gene_colors) +
+
+  labs(
+    title = "Quadrant Plot: MS-Significant Genes",
+    subtitle = "4 Functional Gene Sets Highlighted (log2FC: Medium vs Low)",
+    x = "RNA-seq log2FC",
+    y = "Proteomics log2FC",
+    color = "Gene Set"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    plot.margin = margin(12, 12, 12, 12)
+  )
+
+
+# ✅ Step 6: Print
+print(combined_gene_sets_plot)
+
+```
+# * Make this as -12 to +12 and add the other 2 , AVOID YELLOWS
+#* Add the 2 gene sets
+# * Plot the same genes in the NR CR 
+
+#Plot those specific genes to see if its significant or not
+wss2
+Take each cell line and plot the expression for each individual one. 
+
+```{r}
+# ✅ Required libraries
+library(pheatmap)
+library(dplyr)
+library(tibble)
+
+# ✅ Step 1: Filter gene list from existing plot_df
+selected_genes <- plot_df %>%
+  filter(GeneSet != "Other") %>%
+  pull(gene_symbol) %>%
+  unique()
+
+# ✅ Step 2: Subset qn_log2_matrix directly by selected genes
+expr_log2 <- log2_qn[rownames(log2_qn) %in% selected_genes, ]
+
+# ✅ Step 3: Row-wise z-score scaling (mean 0, sd 1)
+expr_scaled <- t(scale(t(expr_log2)))
+
+# ✅ Step 4: Build annotation for columns (samples)
+sample_annot <- intensity_map %>%
+  dplyr::select(Sample, Sensitivity.group, Cell.type) %>%
+  column_to_rownames("Sample")
+
+# ✅ Step 5: Reorder columns: Low first, then Medium; group by Cell.type
+ordered_samples <- sample_annot %>%
+  arrange(Sensitivity.group, Cell.type) %>%
+  rownames()
+
+expr_scaled <- expr_scaled[, ordered_samples]
+sample_annot <- sample_annot[ordered_samples, ]
+
+# ✅ Step 6: Build annotation for rows (gene set membership)
+gene_annot <- plot_df %>%
+  filter(gene_symbol %in% rownames(expr_scaled)) %>%
+  distinct(gene_symbol, GeneSet) %>%
+  column_to_rownames("gene_symbol")
+
+# ✅ Step 7: Plot heatmap (columns NOT clustered, ordered as specified)
+heat_mp <- pheatmap(
+  expr_scaled,
+  annotation_col = sample_annot,
+  annotation_row = gene_annot,
+  scale = "none",
+  clustering_distance_rows = "euclidean",
+  clustering_method = "complete",
+  cluster_cols = FALSE,
+  cluster_rows = TRUE,
+  color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+  fontsize_row = 8,
+  fontsize_col = 9,
+  main = "Z-Score Heatmap: Secretome & Cell Surface Genes (MS-significant)"
+)
+
+
+
+```
+
+
+# Heatmap of CR/NR
+```{r}
+# === Required Libraries ===
+library(tidyverse)
+library(pheatmap)
+
+# === Step 1: Load expression matrix (raw counts) ===
+expr_crnr <- read.csv("/Users/cojulian/Desktop/Tzu_projects/Matt/Isaac/multiomics/proteomics/CR_NR_matrix.csv", row.names = 1)
+
+# === Step 2: Get selected genes from your MS-significant quadrant plot ===
+selected_genes <- plot_df %>%
+  filter(GeneSet != "Other") %>%
+  pull(gene_symbol) %>%
+  unique()
+
+# Subset only those genes
+expr_subset <- expr_crnr[rownames(expr_crnr) %in% selected_genes, ]
+
+# === Step 3: Log2 + 1 transform and z-score by row ===
+expr_log2 <- log2(expr_subset + 1)
+expr_scaled <- t(scale(t(expr_log2)))
+
+# === Step 4: Order samples: CR first, then NR ===
+ordered_samples <- c(
+  colnames(expr_scaled)[grepl("_CR$", colnames(expr_scaled))],
+  colnames(expr_scaled)[grepl("_NR$", colnames(expr_scaled))]
+)
+
+expr_scaled <- expr_scaled[, ordered_samples]
+
+# === Step 5: Column annotations (CR/NR) ===
+sample_annotation <- data.frame(
+  Response = ifelse(grepl("_CR$", ordered_samples), "CR", "NR")
+)
+rownames(sample_annotation) <- ordered_samples
+
+# === Step 6: Row annotations (Gene Sets) ===
+gene_annotation <- plot_df %>%
+  filter(gene_symbol %in% rownames(expr_scaled)) %>%
+  distinct(gene_symbol, GeneSet) %>%
+  column_to_rownames("gene_symbol")
+
+# === Step 7: Plot heatmap ===
+cr_nr_heatmap <- pheatmap(expr_scaled,
+         annotation_col = sample_annotation,
+         annotation_row = gene_annotation,
+         scale = "none",
+         cluster_rows = TRUE,
+         cluster_cols = FALSE,
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+         fontsize_row = 8,
+         fontsize_col = 9,
+         main = "Z-Score Heatmap: Shared MS-Significant Genes (CR vs NR)")
+```
+
+```{r}
+# === Step 1: Create output directory ===
+output_dir <- "May15_preMay20_results_MS"
+dir.create(output_dir, showWarnings = FALSE)
+
+# === Step 2: Save heatmap from pheatmap (heat_mp) ===
+pdf(file = file.path(output_dir, "heatmap_secretome_surface.pdf"),
+    width = 10, height = 8)  # Adjust size as needed
+print(heat_mp)
+dev.off()
+
+# === Step 3: Save quadrant scatterplot (combined_gene_sets_plot) ===
+ggsave(
+  filename = file.path(output_dir, "quadrant_MS_sig_plot.pdf"),
+  plot = combined_gene_sets_plot,
+  width = 8, height = 6,
+  dpi = 300,
+  device = cairo_pdf  # For better text rendering
+)
+
+# === Step 4: Save CR vs NR heatmap (cr_nr_heatmap) ===
+pdf(file = file.path(output_dir, "heatmap_CR_NR.pdf"),
+    width = 10, height = 8)
+print(cr_nr_heatmap)
+dev.off()
+
+```
+RIPK1 Expression:
+
+# Raw log2
+
+```{r}
+# Raw log2 matrix (before QN)
+log2_raw <- log2(intensity_matrix + 1)
+ripk1_expr_raw <- log2_raw["RIPK1", ]
+
+ripk1_df_raw <- data.frame(
+  Sample = names(ripk1_expr_raw),
+  Expression = as.numeric(ripk1_expr_raw),
+  Sensitivity = intensity_map$Sensitivity.group[match(names(ripk1_expr_raw), intensity_map$Sample)]
+)
+
+ggplot(ripk1_df_raw, aes(x = Sensitivity, y = Expression, fill = Sensitivity)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.15, size = 2.5, color = "black") +
+  scale_fill_manual(values = c("Low" = "#26b3ff", "Medium" = "#ffad73")) +
+  labs(
+    title = "RIPK1 Expression: Medium vs Low",
+    subtitle = "Before Normalization (log2)",
+    x = "Sensitivity Group",
+    y = "log2(Intensity + 1)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+
+```
+
+## After QN and scaled
+```{r}
+# ✅ Get expression values of RIPK1 from log2-transformed QN matrix
+ripk1_expr <- log2_qn["RIPK1", ]
+
+# ✅ Build a proper dataframe for plotting
+ripk1_df <- data.frame(
+  Sample = names(ripk1_expr),
+  Expression = as.numeric(ripk1_expr),
+  Sensitivity = intensity_map$Sensitivity.group[match(names(ripk1_expr), intensity_map$Sample)]
+)
+
+# ✅ Plot: RIPK1 expression between Low and Medium
+library(ggplot2)
+
+ggplot(ripk1_df, aes(x = Sensitivity, y = Expression, fill = Sensitivity)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.15, size = 2.5, color = "black") +
+  scale_fill_manual(values = c("Low" = "#26b3ff", "Medium" = "#ffad73")) +
+  labs(
+    title = "RIPK1 Expression: Medium vs Low",
+    subtitle = "Quantile-Normalized + Log2 Transformed",
+    x = "Sensitivity Group",
+    y = "log2(Intensity + 1)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+
+```
+
+
+

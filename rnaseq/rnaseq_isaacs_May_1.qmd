@@ -1,0 +1,767 @@
+---
+title: "Isaacs"
+format: html
+editor: visual
+---
+
+```{r}
+## Use install.packages() to install these packages:
+suppressMessages(library(tidyverse))
+suppressMessages(library(janitor))
+suppressMessages(library(plotly))
+suppressMessages(library(ggrepel))
+suppressMessages(library(purrr))
+suppressMessages(library(dplyr))
+
+## Use BiocManager::install() to install these packages:
+suppressMessages(library(DESeq2))
+suppressMessages(library(GeneTonic))
+suppressMessages(library(pcaExplorer))
+suppressMessages(library(topGO))
+suppressMessages(library(tidybulk))
+suppressMessages(library(AnnotationDbi))
+suppressMessages(library(org.Hs.eg.db))
+suppressMessages(library(SummarizedExperiment))
+suppressMessages(library(dittoSeq))
+suppressMessages(library(msigdbr))
+suppressMessages(library(fgsea))
+
+library(tidybulk)
+library(ggplot2)
+library(ggrepel)
+library(SummarizedExperiment)
+library(dplyr)
+```
+
+# Loading data dictionary
+
+```{r}
+data_dict <- read.csv("rnaseq_dictionary_Isaacs.csv")
+```
+
+```{r}
+# Load packages
+library(tidyverse)
+
+# 1. Define the base path to the quant.sf files
+quant_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Isaac/multiomics/rnaseq/quant_sf_files_isaac"
+
+# 2. List all quant.sf files recursively
+quant_paths <- list.files(quant_dir, pattern = "quant.sf", recursive = TRUE, full.names = TRUE)
+
+# 3. Extract sample folder names like "IV1_S13" from the paths
+sample_dirs <- dirname(quant_paths)
+sample_ids <- basename(sample_dirs)  # "IV1_S13", etc.
+
+# 4. Extract the Sample code (e.g., "IV1") from the folder name
+sample_codes <- gsub("_S[0-9]+", "", sample_ids)
+
+# 5. Build preliminary quant dictionary
+quant_dict <- data.frame(
+  file_path = quant_paths,
+  sample_folder = sample_ids,
+  Sample = sample_codes,
+  stringsAsFactors = FALSE
+)
+
+# 6. Load your existing data_dict (assumed to already be in your environment)
+# If it's in a CSV or Excel file, you'd use read_csv() or readxl::read_excel() here
+
+# 7. Join quant_dict with your sample metadata
+quant_annotated <- quant_dict %>%
+  left_join(data_dict, by = "Sample") %>%
+  select(file_path, Sample, Replicate.., Cell.type, Sensitivity.group)
+
+# 8. Print the annotated dictionary
+print(quant_annotated)
+
+```
+
+```{r}
+# Load the GTF file
+gtf <- rtracklayer::import("Homo_sapiens.GRCh38.113.gtf.gz")
+gtf_df <- as.data.frame(gtf)
+
+# Create transcript-to-gene table
+tx2gene_df <- gtf_df %>%
+  dplyr::select(transcript_id, gene_id, gene_name) %>%
+  distinct(transcript_id, gene_id, gene_name) %>%
+  drop_na()
+
+tx2gene_df
+```
+
+```{r}
+# Point to your metadata frame
+human_coldata <- quant_annotated
+human_coldata$files <- human_coldata$file_path  # Add a "files" column for compatibility
+
+# Use first file to initialize matrix dimensions and gene list
+tmp <- read.delim(human_coldata$files[1]) %>%
+  inner_join(tx2gene_df, by = c("Name" = "transcript_id")) %>%
+  group_by(gene_id) %>%
+  summarise(NumReads = as.integer(sum(NumReads)))
+
+num.row <- nrow(tmp)
+num.col <- length(human_coldata$files)
+
+# Initialize empty matrix
+sf.df <- data.frame(matrix(0, nrow = num.row, ncol = num.col))
+colnames(sf.df) <- human_coldata$Sample  # Use Sample for column labels
+rownames(sf.df) <- tmp$gene_id
+
+```
+
+```{r}
+# Loop to fill matrix with counts from each quant.sf
+for (i in seq_along(human_coldata$files)) {
+  cat("Reading ", human_coldata$files[i], " Now ..............\n")
+  
+  sf.df[, i] <- read.delim(human_coldata$files[i]) %>%
+    inner_join(tx2gene_df, by = c("Name" = "transcript_id")) %>%
+    group_by(gene_id) %>%
+    summarise(NumReads = as.integer(sum(NumReads))) %>%
+    pull(NumReads)
+}
+
+# Finalize as matrix
+Salmon.matrix <- as.matrix(sf.df)
+colnames(Salmon.matrix) <- human_coldata$Sample
+
+# Set rownames to Sample so it aligns with sf.df.data columns
+human_coldata <- human_coldata %>% 
+  column_to_rownames("Sample")
+
+# Check if all column names in sf.df.data are present in human_coldata rownames
+all(colnames(Salmon.matrix) %in% rownames(human_coldata))
+
+```
+
+```{r}
+# Convert the matrix to a data frame for tidy manipulation
+Salmon.matrix <- as.data.frame(Salmon.matrix)
+
+# Transpose for easier joining and reshaping
+Salmon_long <- Salmon.matrix %>%
+  rownames_to_column("gene_id") %>%
+  pivot_longer(-gene_id, names_to = "Sample", values_to = "expression")
+
+# Join with metadata to attach Sensitivity.group
+Salmon_long <- Salmon_long %>%
+  left_join(human_coldata %>% rownames_to_column("Sample"), by = "Sample")
+
+# Define a threshold for minimum expression (e.g., >10)
+expression_threshold <- 10
+min_samples_per_group <- 2  # e.g., gene must be expressed in at least 2 samples within a group
+
+# For each gene in each group, count how many samples exceed the threshold
+gene_group_counts <- Salmon_long %>%
+  group_by(gene_id, Sensitivity.group) %>%
+  summarise(n_expressed = sum(expression > expression_threshold), .groups = "drop")
+
+# Keep genes that pass the threshold in at least one group
+genes_to_keep <- gene_group_counts %>%
+  filter(n_expressed >= min_samples_per_group) %>%
+  distinct(gene_id)
+
+# Filter original matrix to keep only these genes
+sf.df.data <- Salmon.matrix %>%
+  rownames_to_column("gene_id") %>%
+  filter(gene_id %in% genes_to_keep$gene_id) %>%
+  column_to_rownames("gene_id")
+
+# Preview the filtered matrix
+head(sf.df.data)
+
+```
+
+# Comparing before and after filtering
+
+```{r}
+# 1. Prepare long-format data for unfiltered matrix
+Salmon_long_dist_unfiltered <- as.data.frame(Salmon.matrix) %>%
+  rownames_to_column("gene_id") %>%
+  pivot_longer(-gene_id, names_to = "Sample", values_to = "expression") %>%
+  mutate(stage = "Unfiltered")
+
+# 2. Prepare long-format data for filtered matrix
+Salmon_long_dist_filtered <- sf.df.data %>%
+  rownames_to_column("gene_id") %>%
+  pivot_longer(-gene_id, names_to = "Sample", values_to = "expression") %>%
+  mutate(stage = "Filtered")
+
+# 3. Combine both and log-transform expression
+combined_expression <- bind_rows(Salmon_long_dist_unfiltered, Salmon_long_dist_filtered) %>%
+  mutate(log_expression = log2(expression + 1))  # Avoid log(0)
+
+# 4. Density plot: log2(expression)
+ggplot(combined_expression, aes(x = log_expression, fill = stage)) +
+  geom_density(alpha = 0.4) +
+  labs(
+    title = "Distribution of Log2(Expression) Before vs After Filtering",
+    subtitle = "Filtering removes low-expression genes across samples",
+    x = "log2(Expression + 1)",
+    y = "Density",
+    fill = "Matrix"
+  ) +
+  theme_minimal()
+
+# 5. Boxplot: log2(expression)
+ggplot(combined_expression, aes(x = stage, y = log_expression, fill = stage)) +
+  geom_boxplot(outlier.size = 0.5, alpha = 0.7) +
+  labs(
+    title = "Boxplot of Log2(Expression) Before vs After Filtering",
+    subtitle = "Filtered matrix has higher median expression and tighter range",
+    x = "",
+    y = "log2(Expression + 1)"
+  ) +
+  theme_minimal()
+
+# 6. Gene count summary
+num_genes_unfiltered <- nrow(Salmon.matrix)
+num_genes_filtered <- nrow(sf.df.data)
+
+cat("Number of genes before filtering:", num_genes_unfiltered, "\n")
+cat("Number of genes after filtering:", num_genes_filtered, "\n")
+cat("Percentage of genes retained:", round((num_genes_filtered / num_genes_unfiltered) * 100, 2), "%\n")
+```
+
+# PCA
+
+```{r}
+# Load required packages
+library(tidybulk)
+library(ggplot2)
+library(ggrepel)
+library(SummarizedExperiment)
+library(dplyr)
+
+# 1. Filter out "High" sensitivity samples
+filtered_coldata <- human_coldata %>%
+  dplyr::filter(Sensitivity.group != "High")
+
+filtered_counts <- sf.df.data[, rownames(filtered_coldata)]
+
+# 2. Create SummarizedExperiment object
+human_se <- SummarizedExperiment(
+  assays = list(counts = as.matrix(filtered_counts)),
+  colData = filtered_coldata
+)
+
+# 3. Tidybulk PCA: filter, normalize, reduce
+pca_human <- human_se %>%
+  tidybulk::keep_abundant() %>%
+  tidybulk::scale_abundance() %>%
+  tidybulk::reduce_dimensions(method = "PCA", .dims = 15)
+
+# 4. Plot PCA
+pca_human %>%
+  tidybulk::pivot_sample() %>%
+  ggplot(aes(
+    x = PC1,
+    y = PC2,
+    color = Sensitivity.group,
+    label = Cell.type  # Label with Cell.type
+  )) +
+  geom_point(size = 3, shape = 16) +
+  ggrepel::geom_text_repel(show.legend = FALSE, max.overlaps = 5) +
+  theme_minimal() +
+  labs(
+    title = "PCA of Human Samples (Excluding High Sensitivity)",
+    subtitle = "Colored by Sensitivity Group, labeled by Cell Type",
+    x = "Principal Component 1",
+    y = "Principal Component 2",
+    color = "Sensitivity Group"
+  )
+
+
+```
+
+# Doing QC
+
+```{r}
+# Construct SummarizedExperiment for QC
+sf.df.se <- SummarizedExperiment(
+  assays = list(counts = as.matrix(sf.df.data)),
+  colData = human_coldata
+)
+
+# === Library Size Distribution ===
+library_sizes <- colSums(assay(sf.df.se))
+
+# Create detailed sample names
+detailed_names <- paste(human_coldata$Cell.type, human_coldata$Sensitivity.group, human_coldata$Replicate.., sep = "_")
+
+
+# Plot library size per sample with normal y-axis numbers
+ggplot(data.frame(Sample = detailed_names, LibrarySize = library_sizes), aes(x = Sample, y = LibrarySize)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  scale_y_continuous(labels = scales::comma) +  # 👈 This formats y-axis with commas
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, size = 10),
+    axis.title.x = element_text(size = 13),
+    axis.title.y = element_text(size = 13),
+    plot.title = element_text(size = 15, face = "bold")
+  ) +
+  labs(title = "Library Size Distribution", x = "Sample", y = "Library Size (Raw Counts)")
+
+```
+
+## Correlation plot
+
+```{r}
+cor_matrix <- cor(assay(sf.df.se))
+pheatmap::pheatmap(cor_matrix,
+  clustering_distance_rows = "correlation",
+  clustering_distance_cols = "correlation",
+  main = "Sample Correlation Matrix",
+  labels_row = detailed_names,
+  labels_col = detailed_names,
+  fontsize_row = 9,
+  fontsize_col = 9,
+  fontsize = 11,
+  display_numbers = FALSE,
+  color = colorRampPalette(c("navy", "white", "firebrick3"))(50)
+)
+```
+
+## Dist plot
+
+```{r}
+log_counts <- log2(assay(sf.df.se) + 1)
+
+# Melt for ggplot
+log_counts_long <- reshape2::melt(log_counts)
+colnames(log_counts_long) <- c("Gene", "Sample", "LogExpression")
+
+# Plot
+ggplot(log_counts_long, aes(x = LogExpression, color = Sample)) +
+  geom_density(size = 1) +
+  theme_minimal() +
+  labs(
+    title = "Log2 Gene Expression Distribution by Sample",
+    x = "Log2(Counts + 1)",
+    y = "Density"
+  ) +
+  theme(
+    axis.title = element_text(size = 13),
+    plot.title = element_text(size = 15, face = "bold"),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 9)
+  )
+```
+
+# Doing DE
+
+```{r}
+# 1. Filter metadata and convert Sensitivity.group to factor
+meta_data <- human_coldata %>%
+  dplyr::filter(Sensitivity.group %in% c("Medium", "Low")) %>%
+  dplyr::mutate(Sensitivity.group = factor(Sensitivity.group))
+
+# 2. Match filtered count matrix to metadata samples
+filtered_bulk_matrix <- sf.df.data[, rownames(meta_data)]
+
+# 3. Create DESeq2 dataset
+dds <- DESeqDataSetFromMatrix(
+  countData = as.matrix(filtered_bulk_matrix),
+  colData = meta_data,
+  design = ~ Sensitivity.group
+)
+
+# 4. Run DESeq2
+dds <- DESeq(dds)
+
+# 5. Get DE results: Medium vs Low (genes enriched in Medium)
+res <- results(dds, contrast = c("Sensitivity.group", "Medium", "Low"), alpha = 0.05)
+
+# 6. Summary of results
+summary(res)
+
+# 7. Convert to data frame
+de_results_med_vs_low <- as.data.frame(res) %>%
+  tibble::rownames_to_column("gene_id")
+
+```
+
+# Volcano plot
+
+```{r}
+# Define visual parameters
+cols <- c("up" = "#ffad73", "down" = "#26b3ff", "ns" = "grey")
+sizes <- c("up" = 2, "down" = 2, "ns" = 1)
+alphas <- c("up" = 1, "down" = 1, "ns" = 0.5)
+
+# Prepare DE results for volcano plot
+volcano_data <- de_results_med_vs_low %>%
+  dplyr::left_join(tx2gene_df %>% dplyr::select(gene_id, gene_name), by = "gene_id") %>%
+  dplyr::mutate(GeneSymbol = ifelse(is.na(gene_name), gene_id, gene_name)) %>%
+  dplyr::distinct(gene_id, .keep_all = TRUE) %>%
+  dplyr::select(GeneSymbol, log2FoldChange, padj) %>%
+  dplyr::mutate(FoldChange = 2^log2FoldChange) %>%
+  dplyr::mutate(GeneType = dplyr::case_when(
+    FoldChange >= 1.5 & padj <= 0.05 ~ "up",
+    FoldChange <= (1/1.5) & padj <= 0.05 ~ "down",
+    TRUE ~ "ns"
+  ))
+
+
+# Volcano Plot: Medium vs Low Sensitivity
+volcano_plot <- ggplot(volcano_data, aes(
+    x = log2(FoldChange),
+    y = -log10(padj),
+    fill = GeneType,
+    size = GeneType,
+    alpha = GeneType
+)) +
+    geom_point(shape = 21, colour = "black") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+    geom_vline(xintercept = c(log2(1 / 1.5), log2(1.5)), linetype = "dashed") +
+    scale_fill_manual(values = cols) +
+    scale_size_manual(values = sizes) +
+    scale_alpha_manual(values = alphas) +
+    ggrepel::geom_text_repel(
+        data = dplyr::filter(volcano_data, GeneType != "ns"),
+        aes(
+            x = log2(FoldChange),
+            y = -log10(padj),
+            label = GeneSymbol
+        ),
+        size = 5,
+        color = "darkblue",
+        max.overlaps = 10,
+        min.segment.length = Inf,
+        inherit.aes = FALSE
+    ) +
+    labs(
+        title = "Volcano Plot: Medium vs Low (padj ≤ 0.05, FC ≥ 1.5)",
+        x = "log2(Fold Change)",
+        y = "-log10(Adjusted P-value)"
+    ) +
+    theme_minimal(base_family = "Arial") +
+    theme(
+        panel.background = element_rect(fill = "white", colour = NA),
+        plot.background = element_rect(fill = "white", colour = NA),
+        legend.position = "bottom",
+        plot.title = element_text(size = 20, face = "bold"),
+        axis.title.x = element_text(size = 18),
+        axis.title.y = element_text(size = 18),
+        axis.text = element_text(size = 14),
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 16)
+    )
+
+# Print the plot
+print(volcano_plot)
+
+```
+
+## PA
+
+```{r}
+# Load required libraries
+library(fgsea)
+library(msigdbr)
+library(org.Hs.eg.db)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+
+# === 1. Prepare ranked gene list (ENSEMBL -> ENTREZ) ===
+ranks <- de_results_med_vs_low %>%
+  dplyr::mutate(
+    entrez = mapIds(
+      org.Hs.eg.db,
+      keys = gene_id,
+      column = "ENTREZID",
+      keytype = "ENSEMBL",
+      multiVals = "first"
+    )
+  ) %>%
+  dplyr::filter(!is.na(entrez), !is.na(log2FoldChange)) %>%
+  dplyr::arrange(desc(log2FoldChange)) %>%
+  dplyr::distinct(entrez, .keep_all = TRUE) %>%
+  dplyr::select(entrez, log2FoldChange) %>%
+  deframe()
+
+# === 2. Load Hallmark gene sets ===
+hallmark_sets <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  dplyr::select(gs_name, entrez_gene) %>%
+  split(x = .$entrez_gene, f = .$gs_name)
+
+# === 3. Run fgsea ===
+fgseaRes <- fgsea(
+  pathways = hallmark_sets,
+  stats = ranks,
+  nperm = 10000
+)
+
+# === 4. Clean and annotate results ===
+fgseaResTidy <- fgseaRes %>%
+  dplyr::mutate(
+    pathway = str_replace_all(pathway, "_", " "),
+    NES_direction = ifelse(NES > 0, "Up in Medium", "Up in Low")
+  ) %>%
+  dplyr::filter(pval < 0.08)
+
+# === 5a. Plot Upregulated pathways (NES > 0) ===
+fgseaResTidy %>%
+  filter(NES > 0) %>%
+  arrange(padj) %>%
+  slice_max(order_by = NES, n = 15) %>%
+  ggplot(aes(x = reorder(pathway, NES), y = NES)) +
+  geom_col(fill = "#61BB6F") +
+  coord_flip() +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Top Upregulated Hallmark Pathways (Medium vs Low)",
+    subtitle = "NES > 0, FDR < 0.08",
+    x = "Pathway",
+    y = "Normalized Enrichment Score (NES)"
+  ) +
+  theme(axis.text.y = element_text(size = 9))
+
+# === 5b. Plot Downregulated pathways (NES < 0) ===
+# Plot top 15 enriched pathways regardless of direction
+fgseaResTidy %>%
+  arrange(padj) %>%
+  slice_max(order_by = abs(NES), n = 15) %>%
+  ggplot(aes(x = reorder(pathway, NES), y = NES, fill = NES_direction)) +
+  geom_col() +
+  scale_fill_manual(values = c("Up in Medium" = "#61BB6F", "Up in Low" = "#EC7012")) +
+  coord_flip() +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Top Enriched Hallmark Pathways (Medium vs Low)",
+    subtitle = "Based on NES, FDR < 0.08",
+    x = "Pathway",
+    y = "Normalized Enrichment Score (NES)",
+    fill = "Direction"
+  ) +
+  theme(axis.text.y = element_text(size = 9))
+
+
+```
+
+## GSEA for cell surface
+
+```{r}
+
+# 1. Get GOCC_CELL_SURFACE gene set (ENTREZ IDs)
+gocc_cell_surface <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "CC") %>%
+  filter(gs_name == "GOCC_CELL_SURFACE") %>%
+  distinct(gs_name, entrez_gene) %>%
+  split(x = .$entrez_gene, f = .$gs_name)
+
+# 2. Prepare ranked gene list from your DESeq2 result (log2FC by ENTREZ)
+gene_ranks <- de_results_med_vs_low %>%
+  mutate(entrez = mapIds(org.Hs.eg.db,
+                         keys = gene_id,
+                         column = "ENTREZID",
+                         keytype = "ENSEMBL",
+                         multiVals = "first")) %>%
+  filter(!is.na(entrez), !is.na(log2FoldChange)) %>%
+  distinct(entrez, .keep_all = TRUE) %>%
+  arrange(desc(log2FoldChange)) %>%
+  pull(log2FoldChange, name = entrez)
+
+# 3. Run fgsea using only the GOCC_CELL_SURFACE gene set
+fgsea_surface <- fgsea(
+  pathways = gocc_cell_surface,
+  stats = gene_ranks,
+  nperm = 10000
+)
+
+# 4. Plot enrichment curve for this set
+cell_surface_plot <- plotEnrichment(
+  gocc_cell_surface[[1]],
+  stats = gene_ranks
+) +
+  labs(
+    title = "GSEA Enrichment: Cell Surface GO",
+    subtitle = "Medium vs Low Sensitivity (RNA-seq)",
+    x = "Rank",
+    y = "Enrichment Score"
+  ) +
+  annotate("text", x = -Inf, y = -Inf, hjust = 0, vjust = -0.3,
+           label = "Enriched in Medium") +
+  annotate("text", x = Inf, y = -Inf, hjust = 1, vjust = -0.3,
+           label = "Enriched in Low") +
+  theme_minimal(base_size = 13)
+
+```
+
+## Secretome enrichment
+
+```{r}
+secretome_file <- readxl::read_xlsx("aaz0274_data_file_s2.xlsx") %>% 
+  janitor::clean_names()
+
+# 1. Filter secretome Ensembl IDs (optional: focus on secreted ones only)
+secretome_genes <- secretome_file %>%
+  filter(grepl("Secreted", annotated_category)) %>%  # Optional: only "Secreted" categories
+  pull(ensembl_gene_id) %>%
+  unique()
+
+# 2. Convert Ensembl IDs to ENTREZ
+secretome_entrez <- mapIds(
+  org.Hs.eg.db,
+  keys = secretome_genes,
+  column = "ENTREZID",
+  keytype = "ENSEMBL",
+  multiVals = "first"
+) %>%
+  na.omit() %>%
+  unique()
+
+# 3. Build gene set object (same structure as msigdbr sets)
+secretome_set <- list("Human Secretome" = secretome_entrez)
+
+# 4. Prepare ranked gene list from your DE results (log2FoldChange named by ENTREZ)
+gene_ranks <- de_results_med_vs_low %>%
+  mutate(entrez = mapIds(
+    org.Hs.eg.db,
+    keys = gene_id,
+    column = "ENTREZID",
+    keytype = "ENSEMBL",
+    multiVals = "first"
+  )) %>%
+  filter(!is.na(entrez), !is.na(log2FoldChange)) %>%
+  distinct(entrez, .keep_all = TRUE) %>%
+  arrange(desc(log2FoldChange)) %>%
+  pull(log2FoldChange, name = entrez)
+
+# 5. Run fgsea using the custom secretome set
+fgsea_secretome <- fgsea(
+  pathways = secretome_set,
+  stats = gene_ranks,
+  nperm = 10000
+)
+
+# 6. Plot enrichment curve
+secretome_plot <- plotEnrichment(
+  secretome_set[[1]],
+  stats = gene_ranks
+) +
+  labs(
+    title = "GSEA Enrichment: Human Secretome Genes",
+    subtitle = "Medium vs Low Sensitivity (RNA-seq)",
+    x = "Rank",
+    y = "Enrichment Score"
+  ) +
+  annotate("text", x = -Inf, y = -Inf, hjust = 0, vjust = -0.3,
+           label = "Enriched in Medium") +
+  annotate("text", x = Inf, y = -Inf, hjust = 1, vjust = -0.3,
+           label = "Enriched in Low") +
+  theme_minimal(base_size = 13)
+
+
+```
+
+# Saving plots
+
+```{r}
+# Define output directory
+output_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Isaac/multiomics/rnaseq/presentation_May6_results"
+
+# 📈 Save Secretome Enrichment Plot (High-res PDF)
+ggsave(
+  filename = file.path(output_dir, "GSEA_Secretome_Medium_vs_Low.pdf"),
+  plot = secretome_plot,
+  width = 8,
+  height = 6,
+  device = cairo_pdf,     # Use Cairo for better font embedding and vector quality
+  dpi = 600               # High resolution
+)
+
+# 🧬 Save Cell Surface Enrichment Plot (High-res PDF)
+ggsave(
+  filename = file.path(output_dir, "GSEA_CellSurface_Medium_vs_Low.pdf"),
+  plot = cell_surface_plot,
+  width = 8,
+  height = 6,
+  device = cairo_pdf,
+  dpi = 600
+)
+
+```
+
+## SLC comparison
+
+```{r}
+# Load required packages
+library(dplyr)
+library(ggplot2)
+
+# Extract and process expression for ENSG00000140284 (SLC27A2)
+slc27a2_expression <- sf.df.data %>%
+  tibble::rownames_to_column("gene_id") %>%
+  filter(gene_id == "ENSG00000177455") %>%
+  tidyr::pivot_longer(-gene_id, names_to = "Sample", values_to = "counts") %>%
+  left_join(human_coldata %>% tibble::rownames_to_column("Sample"), by = "Sample") %>%
+  filter(Sensitivity.group %in% c("Low", "Medium")) %>%
+  mutate(
+    Sensitivity.group = factor(Sensitivity.group, levels = c("Low", "Medium")),
+    Sample = factor(Sample, levels = Sample[order(Sensitivity.group)])  # Order samples by group
+  )
+
+# Plot per-sample expression
+ggplot(slc27a2_expression, aes(x = Sample, y = log2(counts + 1), fill = Sensitivity.group)) +
+  geom_bar(stat = "identity", color = "black") +
+  scale_fill_manual(values = c("Low" = "#26b3ff", "Medium" = "#ffad73")) +
+  labs(
+    title = "Expression of CD19 (ENSG00000177455) Per Sample",
+    x = "Sample",
+    y = "log2(Expression + 1)",
+    fill = "Sensitivity Group"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(face = "bold")
+  )
+
+```
+
+```{r}
+# Define gene length (in base pairs)
+gene_length <- 7372  # for ENSG00000177455
+
+# Get library sizes (total counts per sample)
+library_sizes <- colSums(sf.df.data)
+
+# Prepare table
+fpkm_table <- sf.df.data %>%
+  tibble::rownames_to_column("gene_id") %>%
+  filter(gene_id == "ENSG00000177455") %>%
+  pivot_longer(-gene_id, names_to = "Sample", values_to = "counts") %>%
+  left_join(human_coldata %>% tibble::rownames_to_column("Sample"), by = "Sample") %>%
+  filter(Sensitivity.group %in% c("Low", "Medium")) %>%
+  mutate(
+    library_size = library_sizes[Sample],
+    FPKM = (counts * 1e9) / (gene_length * library_size)
+  ) %>%
+  dplyr::select(Sample, FPKM, Sensitivity.group)
+
+# View table
+fpkm_table
+
+write.csv(fpkm_table, paste0(output_dir,"/cd19_fpkm.csv"))
+```
+
+For tomorrow:
+
+# PUT IN FPKM, 3 column table:
+
+Sample name, counts (in fpkm), group 'low/high'
+
+# Secretome and Surfaceome in pdf
+
+------------------------------------------------------------------------
+
+# SCATTER plot of this collapsed using FKPM
+
+# Do the exact same analyses for mass spec
+
+# Plot leading edges heatmap, extrict pvalue\]\[\]

@@ -1,0 +1,897 @@
+---
+title: "R_R_Matt"
+format: html
+editor: visual
+---
+
+## Loading libraries
+
+```{r}
+## Use install.packages() to install these packages:
+suppressMessages(library(tidyverse))
+suppressMessages(library(janitor))
+suppressMessages(library(plotly))
+suppressMessages(library(ggrepel))
+suppressMessages(library(purrr))
+suppressMessages(library(dplyr))
+
+## Use BiocManager::install() to install these packages:
+suppressMessages(library(DESeq2))
+suppressMessages(library(GeneTonic))
+suppressMessages(library(pcaExplorer))
+suppressMessages(library(topGO))
+suppressMessages(library(tidybulk))
+suppressMessages(library(AnnotationDbi))
+suppressMessages(library(org.Hs.eg.db))
+suppressMessages(library(SummarizedExperiment))
+suppressMessages(library(dittoSeq))
+suppressMessages(library(msigdbr))
+suppressMessages(library(fgsea))
+
+
+
+
+```
+
+## Create Data Dictionary
+
+```{r}
+# Define the paths to your nf_results files
+nf_results_path <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Rel_Ref_Matt/nf_results"
+
+# List all quant.sf files in the nf_results directory
+quant_files <- list.files(nf_results_path, pattern = "quant.sf", full.names = TRUE)
+
+# Extract the sample names from the file paths
+sample_names <- gsub("_quant.sf", "", basename(quant_files))
+
+# Create a data frame with the file paths and sample names
+nf_results_dict <- data.frame(
+  file_path = quant_files,
+  sample_name = sample_names,
+  stringsAsFactors = FALSE
+)
+
+# Print the data dictionary
+print(nf_results_dict)
+```
+
+### Add aditional information
+
+```{r}
+# Define the mapping from Genomics Core ID to Julian Coding and Condition
+mapping <- data.frame(
+  Genomics_Core_ID = c("WitMat_1", "WitMat_9", "WitMat_10", "WitMat_11", "WitMat_12", "WitMat_3", "WitMat_4", "WitMat_5", "WitMat_6", "WitMat_8", "WitMat_7", "WitMat_14", "WitMat_15", "WitMat_16", "WitMat_17", "WitMat_18", "WitMat_19", "WitMat_20", "WitMat_21", "WitMat_22", "WitMat_23", "WitMat_24", "WitMat_25", "WitMat_26", "WitMat_27", "WitMat_28"),
+  Condition = c("Remission", "Relapse", "Remission", "Remission", "Remission", "Remission", "Remission", "Remission", "Relapse", "Remission", "Relapse", "Relapse", "Relapse", "Relapse", "Refractory", "Refractory", "Remission", "Remission", "Remission", "Remission", "Relapse", "Remission", "Remission", "Relapse", "Remission", "Remission"),
+  Julian_Coding = c("1_Remission", "2_Relapse", "3_Remission", "5_Remission", "7_Remission", "9_Remission", "10_Remission", "11_Remission", "12_Relapse", "13_Remission", "15_Relapse", "16_Relapse", "17_Relapse", "18_Relapse", "19_Refractory", "20_Refractory", "21_Remission", "22_Remission", "25_Remission", "26_Remission", "27_Relapse", "28_Remission", "29_Remission", "30_Relapse", "34_Remission", "35_Remission"),
+  stringsAsFactors = FALSE
+)
+
+# Merge the mapping with the nf_results_dict
+nf_results_dict <- nf_results_dict %>%
+  mutate(Genomics_Core_ID = gsub("_S[0-9]+", "", sample_name)) %>%
+  left_join(mapping, by = c("Genomics_Core_ID" = "Genomics_Core_ID")) %>%
+  select(file_path, Julian_Coding, Condition)
+
+# Print the updated data dictionary
+print(nf_results_dict)
+```
+
+## GTF
+
+```{r}
+# Load the GTF file for the human genome
+gtf <- rtracklayer::import("Homo_sapiens.GRCh38.113.gtf.gz")
+gtf_df <- as.data.frame(gtf)
+
+# Build the transcript-gene lookup table
+tx2gene_df <- gtf_df %>%
+  dplyr::select(transcript_id, gene_id, gene_name) %>%
+  distinct(transcript_id, gene_id, gene_name) %>%
+  drop_na()
+
+tx2gene_df
+```
+
+## Aggregate Gene Counts Using the Salmon Loop
+
+```{r}
+# Get the list of quant.sf file paths from the merged data dictionary
+human_coldata <- nf_results_dict
+human_coldata$files <- human_coldata$file_path
+
+# Initialize an empty data frame for storing gene counts
+tmp <- read.delim(human_coldata$files[1]) %>%
+  inner_join(tx2gene_df, by = c("Name" = "transcript_id")) %>%
+  group_by(gene_id) %>%
+  summarise(NumReads = as.integer(sum(NumReads)))
+
+num.row <- dim(tmp)[1]
+num.col <- length(human_coldata$files)
+
+sf.df <- data.frame(matrix(0, nrow = num.row, ncol = num.col))
+colnames(sf.df) <- human_coldata$Julian_Coding
+rownames(sf.df) <- tmp$gene_id
+```
+
+```{r}
+# Loop through each Salmon output file and aggregate gene counts
+for (i in seq_along(human_coldata$files)) {
+  cat("Reading ", human_coldata$files[i], " Now ..............\n")
+  
+  sf.df[, i] <- read.delim(human_coldata$files[i]) %>%
+    inner_join(tx2gene_df, by = c("Name" = "transcript_id")) %>%
+    group_by(gene_id) %>%
+    summarise(NumReads = as.integer(sum(NumReads))) %>%
+    pull(NumReads)
+}
+
+# Convert the data frame to a matrix
+Salmon.matrix <- as.matrix(sf.df)
+colnames(Salmon.matrix) <- human_coldata$Julian_Coding
+```
+
+## Subsetting count matrix
+
+```{r}
+
+# Convert the matrix to a data frame for further processing
+Salmon.matrix <- as.data.frame(Salmon.matrix)
+
+# Filter low expressors: keep genes expressed >10 in at least half of the samples
+sf.df.data <- Salmon.matrix %>%
+  drop_na() %>%
+  # Count the number of samples where expression is > 10
+  mutate(Rowsum = rowSums(. > 10)) %>%
+  # Filter rows where at least half of the samples have values > 10
+  dplyr::filter(Rowsum >= ncol(Salmon.matrix) / 2) %>%
+  dplyr::select(-Rowsum)
+
+# View the filtered data
+head(sf.df.data)
+```
+
+```{r}
+human_coldata <- human_coldata %>% 
+  column_to_rownames("Julian_Coding")
+# Check if all column names in sf.df.data are present in the row names of coldata
+all(colnames(sf.df.data) %in% rownames(human_coldata))
+```
+
+## First PCA
+
+```{r}
+# Create a SummarizedExperiment object
+human_se <- SummarizedExperiment(assays = list(counts = as.matrix(sf.df.data)),
+                                 colData = human_coldata)
+
+# Perform PCA
+human_se %>%
+  keep_abundant() %>%
+  scale_abundance() %>%
+  reduce_dimensions(method = "PCA", .dims = 15) -> pca_human
+
+# Plot PCA results
+pca_human %>%
+  pivot_sample() %>%
+  ggplot(aes(x = PC1, y = PC2, colour = Condition, label = rownames(human_coldata))) +
+  geom_point(size = 3) +
+  geom_text_repel(show.legend = FALSE, max.overlaps = 5) +
+  theme_minimal() +
+  labs(title = "PCA of Human Samples by Condition and Julian Coding",
+       x = "Principal Component 1",
+       y = "Principal Component 2")
+```
+
+## What is driving PCA2?
+
+```{r}
+# Extract PCA loadings
+pca_loadings <- pca_human$rotation
+
+# Focus on PC2 loadings
+pc2_loadings <- pca_loadings[, "PC2"]
+
+# Convert PCA loadings to a data frame
+pca_loadings_df <- as.data.frame(pca_loadings) %>%
+  rownames_to_column(var = "gene_id")
+
+# Ensure tx2gene_df has unique mappings of gene_id to gene_name
+tx2gene_df <- tx2gene_df %>%
+  distinct(gene_id, gene_name)
+
+# Merge PCA loadings with gene names
+pca_loadings_annotated <- pca_loadings_df %>%
+  left_join(tx2gene_df, by = "gene_id")
+
+# Sort by PC2 loadings
+pc2_loadings_sorted <- pca_loadings_annotated %>%
+  arrange(desc(PC2))  # Sort in descending order for PC2
+
+# Extract top 10 positive and negative drivers
+top_genes_pc2 <- head(pc2_loadings_sorted, 10)  # Top 10 positive drivers
+bottom_genes_pc2 <- tail(pc2_loadings_sorted, 10)  # Top 10 negative drivers
+
+# Combine top and bottom genes
+top_bottom_genes <- bind_rows(top_genes_pc2, bottom_genes_pc2)
+
+# Create a bar plot of the top drivers
+ggplot(top_bottom_genes, aes(x = reorder(gene_name, PC2), y = PC2, fill = PC2 > 0)) +
+    geom_bar(stat = "identity") +
+    coord_flip() +
+    labs(
+        title = "Top Drivers of PC2 (Gene Names)",
+        x = "Genes",
+        y = "PC2 Loading"
+    ) +
+    theme_minimal()
+
+```
+
+## Building BiPlot
+
+```{r}
+library(ggbiplot)
+library(ggplot2)
+library(dplyr)
+
+pca_human <- prcomp(t(sf.df.data), scale. = TRUE)
+
+# Create the biplot
+ggbiplot(pca_human,
+         obs.scale = 1, var.scale = 1,
+         groups = human_coldata$Condition,
+         ellipse = TRUE, circle = TRUE,
+         varname.size = 4, varname.color = "red") +
+  labs(title = "Biplot of PCA",
+       x = "Principal Component 1",
+       y = "Principal Component 2",
+       fill = "Condition", color = "Condition") +
+  theme_minimal(base_size = 14) +
+  theme(legend.direction = 'horizontal', legend.position = 'top')
+```
+
+## Running comparisons
+
+```{r}
+
+# Ensure the count matrix and metadata are correctly set up
+filtered_bulk_matrix <- as.matrix(sf.df.data)
+meta_data <- human_coldata
+
+# Combine "Relapse" and "Refractory" into a single condition
+meta_data$Condition <- ifelse(meta_data$Condition %in% c("Relapse", "Refractory"), "Relapse_Refractory", meta_data$Condition)
+
+# Check the updated metadata
+print(meta_data)
+
+# Create DESeq2 dataset
+dds <- DESeqDataSetFromMatrix(countData = filtered_bulk_matrix, colData = meta_data, design = ~ Condition)
+
+# Run DESeq2
+dds <- DESeq(dds)
+
+# Get DE results for Remission vs. Relapse_Refractory
+res <- results(dds, contrast = c("Condition", "Relapse_Refractory", "Remission"), alpha = 0.05)
+summary(res)
+
+# Convert DE results to a data frame
+de_results_rem_vs_relref <- as.data.frame(res) %>%
+  rownames_to_column("gene_id")
+
+# View the top differentially expressed genes
+head(de_results_rem_vs_relref)
+```
+
+## Volcano plot using pdajusted 0.05
+
+```{r, fig.height=10, fig.width=15}
+# Define custom colors, sizes, and alphas for the plot
+cols <- c("up" = "#ffad73", "down" = "#26b3ff", "ns" = "grey")
+sizes <- c("up" = 2, "down" = 2, "ns" = 1)
+alphas <- c("up" = 1, "down" = 1, "ns" = 0.5)
+
+# Prepare DE results data for plotting
+volcano_data <- de_results_rem_vs_relref %>%
+  left_join(tx2gene_df %>% dplyr::select(gene_id, gene_name), by = "gene_id") %>%
+  # Use gene_name where available; otherwise, fallback to gene_id
+  mutate(GeneSymbol = ifelse(is.na(gene_name), gene_id, gene_name)) %>%
+  distinct(gene_id, .keep_all = TRUE) %>%
+  # Select only the necessary columns
+  dplyr::select(GeneSymbol, log2FoldChange, padj) %>%
+  # Calculate fold change and classify genes
+  mutate(FoldChange = 2^log2FoldChange) %>%
+  mutate(GeneType = case_when(
+    FoldChange >= 1.5 & padj <= 0.05 ~ "up",
+    FoldChange <= (1/1.5) & padj <= 0.05 ~ "down",
+    TRUE ~ "ns"
+  ))
+
+# Update the Volcano plot to highlight only genes meeting both thresholds
+volcano_plot <- volcano_data %>%
+  ggplot(aes(x = log2(FoldChange), y = -log10(padj), fill = GeneType, size = GeneType, alpha = GeneType)) +
+  geom_point(shape = 21, colour = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") + # Threshold line for 0.05 padj
+  geom_vline(xintercept = c(log2(1/1.5), log2(1.5)), linetype = "dashed") + # Threshold lines for FoldChange of 1.5
+  scale_fill_manual(values = cols) +
+  scale_size_manual(values = sizes) +
+  scale_alpha_manual(values = alphas) +
+  geom_text_repel(
+    data = filter(volcano_data, GeneType != "ns"), # Only label "up" and "down" genes
+    aes(x = log2(FoldChange), y = -log10(padj), label = GeneSymbol),
+    size = 5,
+    color = "darkblue",
+    max.overlaps = 10,
+    min.segment.length = Inf,
+    inherit.aes = FALSE
+  ) +
+  labs(title = "Volcano Plot of Remission vs Relapse/Refractory (padj ≤ 0.05, Fold Change ≥ 1.5)",
+       x = "log2(Fold Change)",
+       y = "-log10(Adjusted P-value)") +
+  theme_minimal(base_family = "Arial") +
+  theme(
+    panel.background = element_rect(fill = "white", colour = NA),
+    plot.background = element_rect(fill = "white", colour = NA),
+    legend.position = "bottom",
+    plot.title = element_text(size = 20, face = "bold"),
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_text(size = 18),
+    axis.text = element_text(size = 14),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 16)
+  )
+
+# Print the volcano plot
+print(volcano_plot)
+```
+
+## Running GSEA
+
+```{r}
+# Retrieve the HALLMARK_FATTY_ACID_METABOLISM gene set for Homo sapiens
+hallmark_fatty_acid_metabolism <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  filter(gs_name == "HALLMARK_FATTY_ACID_METABOLISM")
+head(hallmark_fatty_acid_metabolism)
+
+# Prepare pathway list for fgsea
+fgsea_hallmark_sets <- hallmark_fatty_acid_metabolism %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# Add gene symbols to DE results using tx2gene_df
+de_results_rem_vs_relref <- de_results_rem_vs_relref %>%
+  left_join(tx2gene_df %>% dplyr::select(gene_id, gene_name), by = c("gene_id" = "gene_id"))
+
+# Generate ranked gene list based on log2FoldChange and gene symbols
+ranks <- de_results_rem_vs_relref %>%
+  filter(!is.na(gene_name)) %>%
+  dplyr::select(gene_name, log2FoldChange) %>%
+  arrange(desc(log2FoldChange)) %>%
+  deframe()
+
+# Remove duplicate gene names
+ranks <- ranks[!duplicated(names(ranks))]
+
+# Ensure there is a mix of upregulated and downregulated genes
+ranks <- ranks[order(ranks, decreasing = TRUE)]
+
+
+# Perform GSEA
+fgseaRes <- fgsea(pathways = fgsea_hallmark_sets, stats = ranks)
+
+# Tidy up the fgsea results
+fgseaResTidy <- fgseaRes %>%
+  mutate(abbrev_pathway = abbreviate(pathway)) %>%  # Abbreviate pathway names for readability
+  relocate(abbrev_pathway, .after = pathway) %>%
+  as_tibble() %>%
+  arrange(padj)  # Sort by adjusted p-value
+
+# View the results
+fgseaResTidy
+
+# Plot the enrichment results for HALLMARK_FATTY_ACID_METABOLISM
+plotEnrichment(fgsea_hallmark_sets[["HALLMARK_FATTY_ACID_METABOLISM"]], ranks) +
+  labs(title="Enrichment Plot: HALLMARK_FATTY_ACID_METABOLISM on Remission vs Relapse/Refractory")
+```
+
+## Expression of slc27a2
+
+```{r}
+# Extract SLC27A2 expression data
+slc27a2_expression <- filtered_bulk_matrix["ENSG00000140284", ]  # Replace with the correct gene_id for SLC27A2
+
+# Create a data frame for plotting
+slc27a2_df <- data.frame(
+  Sample = colnames(filtered_bulk_matrix),
+  Expression = slc27a2_expression,
+  Condition = meta_data$Condition
+)
+
+# Plot SLC27A2 expression for both groups
+ggplot(slc27a2_df, aes(x = Condition, y = Expression, fill = Condition)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2) +
+  theme_minimal() +
+  labs(title = "SLC27A2 Expression in Remission vs Relapse/Refractory",
+       x = "Condition",
+       y = "Expression Level") +
+  theme(legend.position = "none")
+```
+
+## ANNOVA
+
+```{r}
+# Create a data frame for analysis
+# Extract SLC27A2 expression data
+slc27a2_expression <- filtered_bulk_matrix["ENSG00000140284", ]  # Replace with the correct gene_id for SLC27A2
+
+# Create a data frame for analysis
+slc27a2_df <- data.frame(
+  Sample = colnames(filtered_bulk_matrix),
+  Expression = slc27a2_expression,
+  Condition = meta_data$Condition
+)
+
+# Calculate the average expression levels for each condition
+average_expression <- slc27a2_df %>%
+  group_by(Condition) %>%
+  summarize(Average_Expression = mean(Expression))
+
+print(average_expression)
+
+# Perform ANOVA
+anova_result <- aov(Expression ~ Condition, data = slc27a2_df)
+summary(anova_result)
+
+# Plot SLC27A2 expression for both groups
+ggplot(slc27a2_df, aes(x = Condition, y = Expression, fill = Condition)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2) +
+  theme_minimal() +
+  labs(title = "SLC27A2 Expression in Remission vs Relapse/Refractory",
+       x = "Condition",
+       y = "Expression Level") +
+  theme(legend.position = "none")
+```
+
+## Removing Refractory, this is, only remission vs relapse
+
+### PCA
+
+```{r}
+filtered_coldata <- human_coldata %>% filter(Condition != "Refractory")
+filtered_counts <- sf.df.data[, rownames(filtered_coldata)]
+
+# Create a SummarizedExperiment object with the filtered data
+human_se <- SummarizedExperiment(assays = list(counts = as.matrix(filtered_counts)),
+                                 colData = filtered_coldata)
+
+# Perform PCA
+human_se %>%
+  keep_abundant() %>%
+  scale_abundance() %>%
+  reduce_dimensions(method = "PCA", .dims = 15) -> pca_human
+
+# Plot PCA results
+pca_human %>%
+  pivot_sample() %>%
+  ggplot(aes(x = PC1, y = PC2, colour = Condition, label = rownames(filtered_coldata))) +
+  geom_point(size = 3) +
+  geom_text_repel(show.legend = FALSE, max.overlaps = 5) +
+  theme_minimal() +
+  labs(title = "PCA of Human Samples by Condition",
+       x = "Principal Component 1",
+       y = "Principal Component 2")
+```
+
+### Differential Expression Analysis
+
+```{r}
+# Filter out Refractory samples
+meta_data <- human_coldata %>% filter(Condition != "Refractory")
+filtered_bulk_matrix <- sf.df.data[, rownames(meta_data)]
+
+# Create DESeq2 dataset
+dds <- DESeqDataSetFromMatrix(countData = as.matrix(filtered_bulk_matrix), colData = meta_data, design = ~ Condition)
+
+# Run DESeq2
+dds <- DESeq(dds)
+
+# Get DE results for Remission vs. Relapse
+res <- results(dds, contrast = c("Condition", "Relapse", "Remission"), alpha = 0.05)
+summary(res)
+
+# Convert DE results to a data frame
+de_results_rem_vs_rel <- as.data.frame(res) %>%
+  rownames_to_column("gene_id")
+
+# View the top differentially expressed genes
+head(de_results_rem_vs_rel)
+```
+
+### Volcano Plot
+
+```{r}
+# Prepare DE results data for plotting
+volcano_data <- de_results_rem_vs_rel %>%
+  left_join(tx2gene_df %>% dplyr::select(gene_id, gene_name), by = "gene_id") %>%
+  mutate(GeneSymbol = ifelse(is.na(gene_name), gene_id, gene_name)) %>%
+  distinct(gene_id, .keep_all = TRUE) %>%
+  dplyr::select(GeneSymbol, log2FoldChange, padj) %>%
+  mutate(FoldChange = 2^log2FoldChange) %>%
+  mutate(GeneType = case_when(
+    FoldChange >= 1.5 & padj <= 0.05 ~ "up",
+    FoldChange <= (1/1.5) & padj <= 0.05 ~ "down",
+    TRUE ~ "ns"
+  ))
+
+# Update the Volcano plot
+volcano_plot <- volcano_data %>%
+  ggplot(aes(x = log2(FoldChange), y = -log10(padj), fill = GeneType, size = GeneType, alpha = GeneType)) +
+  geom_point(shape = 21, colour = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  geom_vline(xintercept = c(log2(1/1.5), log2(1.5)), linetype = "dashed") +
+  scale_fill_manual(values = cols) +
+  scale_size_manual(values = sizes) +
+  scale_alpha_manual(values = alphas) +
+  geom_text_repel(
+    data = filter(volcano_data, GeneType != "ns"),
+    aes(x = log2(FoldChange), y = -log10(padj), label = GeneSymbol),
+    size = 5,
+    color = "darkblue",
+    max.overlaps = 10,
+    min.segment.length = Inf,
+    inherit.aes = FALSE
+  ) +
+  labs(title = "Volcano Plot of Remission vs Relapse (padj ≤ 0.05, Fold Change ≥ 1.5)",
+       x = "log2(Fold Change)",
+       y = "-log10(Adjusted P-value)") +
+  theme_minimal(base_family = "Arial") +
+  theme(
+    panel.background = element_rect(fill = "white", colour = NA),
+    plot.background = element_rect(fill = "white", colour = NA),
+    legend.position = "bottom",
+    plot.title = element_text(size = 20, face = "bold"),
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_text(size = 18),
+    axis.text = element_text(size = 14),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 16)
+  )
+
+# Print the volcano plot
+print(volcano_plot)
+```
+
+### GSEA
+
+```{r}
+# Retrieve the HALLMARK_FATTY_ACID_METABOLISM gene set for Homo sapiens
+hallmark_fatty_acid_metabolism <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  filter(gs_name == "HALLMARK_FATTY_ACID_METABOLISM")
+head(hallmark_fatty_acid_metabolism)
+
+# Prepare pathway list for fgsea
+fgsea_hallmark_sets <- hallmark_fatty_acid_metabolism %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# Add gene symbols to DE results using tx2gene_df
+de_results_rem_vs_rel <- de_results_rem_vs_rel %>%
+  left_join(tx2gene_df %>% dplyr::select(gene_id, gene_name), by = c("gene_id" = "gene_id"))
+
+# Generate ranked gene list based on log2FoldChange and gene symbols
+ranks <- de_results_rem_vs_rel %>%
+  filter(!is.na(gene_name)) %>%
+  dplyr::select(gene_name, log2FoldChange) %>%
+  arrange(desc(log2FoldChange)) %>%
+  deframe()
+
+# Remove duplicate gene names
+ranks <- ranks[!duplicated(names(ranks))]
+
+# Ensure there is a mix of upregulated and downregulated genes
+ranks <- ranks[order(ranks, decreasing = TRUE)]
+
+
+
+# Perform GSEA
+fgseaRes <- fgsea(pathways = fgsea_hallmark_sets, stats = ranks)
+
+# Tidy up the fgsea results
+fgseaResTidy <- fgseaRes %>%
+  mutate(abbrev_pathway = abbreviate(pathway)) %>%  # Abbreviate pathway names for readability
+  relocate(abbrev_pathway, .after = pathway) %>%
+  as_tibble() %>%
+  arrange(padj)  # Sort by adjusted p-value
+
+# View the results
+fgseaResTidy
+
+# Plot the enrichment results for HALLMARK_FATTY_ACID_METABOLISM
+plotEnrichment(fgsea_hallmark_sets[["HALLMARK_FATTY_ACID_METABOLISM"]], ranks) +
+  labs(title="Enrichment Plot: HALLMARK_FATTY_ACID_METABOLISM on Remission vs Relapse")
+```
+
+## Removing the PC2 odd samples
+
+```{r}
+# Remove specified samples from human_coldata
+samples_to_remove <- c("19_Refractory", "15_Relapse", "2_Relapse", "26_Remission")
+
+# Filter human_coldata
+human_coldata_filtered <- human_coldata %>%
+  filter(!rownames(human_coldata) %in% samples_to_remove)
+
+# Filter columns in the count matrix (sf.df.data) corresponding to the removed samples
+sf.df.data_filtered <- sf.df.data %>%
+  select(-all_of(samples_to_remove))
+
+# Create a SummarizedExperiment object with the filtered data
+human_se_filtered <- SummarizedExperiment(
+  assays = list(counts = as.matrix(sf.df.data_filtered)),
+  colData = human_coldata_filtered
+)
+
+# Perform PCA on the filtered data
+human_se_filtered %>%
+  keep_abundant() %>%
+  scale_abundance() %>%
+  reduce_dimensions(method = "PCA", .dims = 15) -> pca_odd_removed
+
+# Plot PCA results with updated object
+pca_odd_removed %>%
+  pivot_sample() %>%
+  ggplot(aes(x = PC1, y = PC2, colour = Condition, label = rownames(human_coldata_filtered))) +
+  geom_point(size = 3) +
+  geom_text_repel(show.legend = FALSE, max.overlaps = 15) +
+  theme_minimal() +
+  labs(
+    title = "PCA of Human Samples by Condition and Julian Coding (Odd Samples Removed)",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  )
+
+```
+
+## Updated DEG
+
+```{r}
+# Define samples to remove
+samples_to_remove <- c("19_Refractory", "15_Relapse", "2_Relapse", "26_Remission")
+
+# Filter metadata to remove specified samples and combine "Relapse" and "Refractory"
+meta_data_filtered <- human_coldata %>%
+  filter(!rownames(human_coldata) %in% samples_to_remove) %>%
+  mutate(Condition = ifelse(Condition %in% c("Relapse", "Refractory"), "Relapse_Refractory", Condition))
+
+# Filter count matrix to match updated metadata
+filtered_bulk_matrix <- sf.df.data[, rownames(meta_data_filtered)]
+
+# Check the updated metadata
+print(meta_data_filtered)
+
+# Create DESeq2 dataset
+dds_filtered <- DESeqDataSetFromMatrix(countData = as.matrix(filtered_bulk_matrix), 
+                                       colData = meta_data_filtered, 
+                                       design = ~ Condition)
+
+# Run DESeq2
+dds_filtered <- DESeq(dds_filtered)
+
+# Get DE results for Remission vs. Relapse_Refractory
+res_filtered <- results(dds_filtered, contrast = c("Condition", "Relapse_Refractory", "Remission"), alpha = 0.05)
+summary(res_filtered)
+
+# Convert DE results to a data frame
+de_results_rem_vs_relref_filtered <- as.data.frame(res_filtered) %>%
+  rownames_to_column("gene_id")
+
+# View the top differentially expressed genes
+head(de_results_rem_vs_relref_filtered)
+```
+
+## Volcano for PC2
+
+```{r}
+# Define custom colors, sizes, and alphas for the plot
+cols <- c("up" = "#ffad73", "down" = "#26b3ff", "ns" = "grey")
+sizes <- c("up" = 2, "down" = 2, "ns" = 1)
+alphas <- c("up" = 1, "down" = 1, "ns" = 0.5)
+
+# Prepare DE results data for plotting
+volcano_data_filtered <- de_results_rem_vs_relref_filtered %>%
+  left_join(tx2gene_df %>% dplyr::select(gene_id, gene_name), by = "gene_id") %>%
+  # Use gene_name where available; otherwise, fallback to gene_id
+  mutate(GeneSymbol = ifelse(is.na(gene_name), gene_id, gene_name)) %>%
+  distinct(gene_id, .keep_all = TRUE) %>%
+  # Select only the necessary columns
+  dplyr::select(GeneSymbol, log2FoldChange, padj) %>%
+  # Calculate fold change and classify genes
+  mutate(FoldChange = 2^log2FoldChange) %>%
+  mutate(GeneType = case_when(
+    FoldChange >= 1.5 & padj <= 0.05 ~ "up",
+    FoldChange <= (1/1.5) & padj <= 0.05 ~ "down",
+    TRUE ~ "ns"
+  ))
+
+# Create the volcano plot
+volcano_plot_filtered <- volcano_data_filtered %>%
+  ggplot(aes(x = log2(FoldChange), y = -log10(padj), fill = GeneType, size = GeneType, alpha = GeneType)) +
+  geom_point(shape = 21, colour = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") + # Threshold line for 0.05 padj
+  geom_vline(xintercept = c(log2(1/1.5), log2(1.5)), linetype = "dashed") + # Threshold lines for FoldChange of 1.5
+  scale_fill_manual(values = cols) +
+  scale_size_manual(values = sizes) +
+  scale_alpha_manual(values = alphas) +
+  geom_text_repel(
+    data = filter(volcano_data_filtered, GeneType != "ns"), # Only label "up" and "down" genes
+    aes(x = log2(FoldChange), y = -log10(padj), label = GeneSymbol),
+    size = 5,
+    color = "darkblue",
+    max.overlaps = 10,
+    min.segment.length = Inf,
+    inherit.aes = FALSE
+  ) +
+  labs(title = "Volcano Plot of Remission vs Relapse/Refractory (Filtered Samples, padj ≤ 0.05, Fold Change ≥ 1.5)",
+       x = "log2(Fold Change)",
+       y = "-log10(Adjusted P-value)") +
+  theme_minimal(base_family = "Arial") +
+  theme(
+    panel.background = element_rect(fill = "white", colour = NA),
+    plot.background = element_rect(fill = "white", colour = NA),
+    legend.position = "bottom",
+    plot.title = element_text(size = 20, face = "bold"),
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_text(size = 18),
+    axis.text = element_text(size = 14),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 16)
+  )
+
+# Print the volcano plot
+print(volcano_plot_filtered)
+
+```
+
+```{r}
+# Define samples to remove
+samples_to_remove <- c("19_Refractory", "15_Relapse", "2_Relapse", "26_Remission")
+
+# Filter metadata and remove specific samples
+meta_data_filtered <- human_coldata %>%
+  filter(!rownames(human_coldata) %in% samples_to_remove) %>%
+  mutate(Condition = ifelse(Condition %in% c("Relapse", "Refractory"), "Relapse_Refractory", Condition))
+
+# Filter count matrix to match updated metadata
+filtered_bulk_matrix <- sf.df.data[, rownames(meta_data_filtered)]
+
+# Add gene symbols to DE results using tx2gene_df
+de_results_rem_vs_relref_filtered <- de_results_rem_vs_relref_filtered %>%
+  left_join(tx2gene_df %>% dplyr::select(gene_id, gene_name), by = c("gene_id" = "gene_id"))
+
+# Generate ranked gene list based on log2FoldChange
+ranks <- de_results_rem_vs_relref_filtered %>%
+  filter(!is.na(gene_name)) %>%
+  dplyr::select(gene_name, log2FoldChange) %>%
+  arrange(desc(log2FoldChange)) %>%
+  deframe()
+
+# Remove duplicate gene names
+ranks <- ranks[!duplicated(names(ranks))]
+
+# Ensure there is a mix of upregulated and downregulated genes
+ranks <- ranks[order(ranks, decreasing = TRUE)]
+
+
+## Retrieve the HALLMARK_FATTY_ACID_METABOLISM gene set for Homo sapiens
+hallmark_fatty_acid_metabolism <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  filter(gs_name == "HALLMARK_FATTY_ACID_METABOLISM")
+
+# Prepare pathway list for fgsea
+fgsea_hallmark_sets <- hallmark_fatty_acid_metabolism %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# Perform GSEA
+fgseaRes <- fgsea(pathways = fgsea_hallmark_sets, stats = ranks)
+
+# Tidy up the fgsea results
+fgseaResTidy <- fgseaRes %>%
+  mutate(abbrev_pathway = abbreviate(pathway)) %>%  # Abbreviate pathway names for readability
+  relocate(abbrev_pathway, .after = pathway) %>%
+  as_tibble() %>%
+  arrange(padj)  # Sort by adjusted p-value
+
+# View the results
+fgseaResTidy
+
+# Plot the enrichment results for HALLMARK_FATTY_ACID_METABOLISM
+plotEnrichment(fgsea_hallmark_sets[["HALLMARK_FATTY_ACID_METABOLISM"]], ranks) +
+  labs(title = "Enrichment Plot: HALLMARK_FATTY_ACID_METABOLISM on Remission vs Relapse/Refractory")
+
+```
+
+# SLC stuff
+
+```{r}
+# Define SLC27A2 gene_id
+slc27a2_gene_id <- "ENSG00000140284"  # Gene ID for SLC27A2
+
+# Extract SLC27A2 expression data from the filtered bulk matrix
+slc27a2_expression <- filtered_bulk_matrix[slc27a2_gene_id, ]
+
+# Create a data frame for plotting
+slc27a2_df <- data.frame(
+  Sample = colnames(filtered_bulk_matrix),
+  Expression = slc27a2_expression,
+  Condition = meta_data_filtered$Condition  # Use the filtered metadata
+)
+
+slc27a2_tidy <- slc27a2_df %>%
+  pivot_longer(
+    cols = starts_with("Expression."),  # Select all "Expression.*" columns
+    names_to = "Measurement",           # New column for the measurement type
+    values_to = "Expression"            # Column for expression values
+  )
+
+# Check the reshaped data
+head(slc27a2_tidy)
+
+# Plot SLC27A2 expression
+ggplot(slc27a2_tidy, aes(x = Condition, y = Expression, fill = Condition)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2, alpha = 0.7) +
+  theme_minimal() +
+  labs(
+    title = "SLC27A2 Expression Across Conditions",
+    x = "Condition",
+    y = "Expression Level"
+  ) +
+  theme(legend.position = "none")
+
+
+```
+
+n of slc27a2
+
+```{r}
+# Ensure the row names of meta_data_filtered match the names of slc27a2_expression
+meta_data_filtered <- meta_data_filtered[match(names(slc27a2_expression), rownames(meta_data_filtered)), ]
+
+# Check if the alignment is correct
+all(names(slc27a2_expression) == rownames(meta_data_filtered))  # Should return TRUE
+
+
+# Create a data frame for plotting
+slc27a2_df <- data.frame(
+  Sample = names(slc27a2_expression),
+  Expression = as.numeric(slc27a2_expression),
+  Condition = meta_data_filtered$Condition
+)
+
+# Plot SLC27A2 expression for both groups
+library(ggplot2)
+ggplot(slc27a2_df, aes(x = Condition, y = Expression, fill = Condition)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2, color = "black") +
+  theme_minimal() +
+  labs(title = "SLC27A2 Expression in Remission vs Relapse/Refractory",
+       x = "Condition",
+       y = "Expression Level") +
+  theme(legend.position = "none")
+
+
+
+```
+
+```{r}
+# Calculate the average expression levels for each condition
+average_expression <- slc27a2_df %>%
+  group_by(Condition) %>%
+  summarize(Average_Expression = mean(Expression))
+
+print(average_expression)
+
+# Perform ANOVA
+anova_result <- aov(Expression ~ Condition, data = slc27a2_df)
+summary(anova_result)
+
+```
