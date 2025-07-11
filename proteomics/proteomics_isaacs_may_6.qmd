@@ -16,11 +16,14 @@ library(SummarizedExperiment)  # Core data container
 library(ggrepel)               # Non-overlapping plot labels
 library(broom)                 # Clean test output
 library(car)                   # For Levene’s test (equal variances)
+library(limma)
 ```
 
 # Read the proteomics csv
 
 ```{r}
+
+
 matrix_all <- read.csv("matrix_proteomics_isaac.csv") %>% janitor::clean_names() %>%  mutate(gene = if_else(entry_name == "YJ005_HUMAN", "FLJ45252", gene))
 
 matrix_human <- matrix_all %>%
@@ -38,13 +41,11 @@ duplicated_gene_rows <- matrix_human %>%
 duplicated_gene_rows
 ```
 
-
-
 # Data dict
+
 ```{r}
 samples_proteins <- read.csv("rnaseq_dictionary_Isaacs.csv")
 ```
-
 
 ```{r}
 
@@ -77,7 +78,6 @@ intensity_map <- tibble::tibble(
 
 
 ```
-
 
 ```{r}
 # Step 1: Define renaming logic for the specific protein isoforms
@@ -132,8 +132,7 @@ intensity_matrix <- intensity_matrix[keep_proteins, ]
 
 ```
 
-
-# Try quantile normalization
+# 🤞 Try quantile normalization
 
 ```{r}
 library(preprocessCore)
@@ -243,7 +242,65 @@ ggplot(pca_df, aes(PC1, PC2, color = Group, label = CellType)) +
 
 # Q-Q plot
 
+## Testing
+
+```{r}
+library(tidyverse)
+library(car)  # for Levene's test
+
+# Step 1: Prepare long-format data
+proteomics_long <- scaled_data %>%
+    as.data.frame() %>%
+    rownames_to_column("Protein") %>%
+    pivot_longer(-Protein, names_to = "Sample", values_to = "Abundance") %>%
+    left_join(intensity_map %>% dplyr::rename(Sample = Sample), by = "Sample") %>%
+    dplyr::select(Protein, Sample, Abundance, Sensitivity.group) %>%
+    mutate(Group = Sensitivity.group)
+
+# Step 2: Shapiro-Wilk normality test per protein and group
+shapiro_results <- proteomics_long %>%
+    group_by(Protein, Group) %>%
+    summarise(shapiro_p = tryCatch(shapiro.test(Abundance)$p.value, error = function(e) NA_real_), .groups = "drop") %>%
+    pivot_wider(names_from = Group, values_from = shapiro_p, names_prefix = "shapiro_") %>%
+    mutate(normal_Low = shapiro_Low > 0.05, normal_Medium = shapiro_Medium > 0.05)
+
+# Step 3: Levene’s test for equal variance
+levene_results <- proteomics_long %>%
+    group_by(Protein) %>%
+    summarise(
+        levene_p = tryCatch(leveneTest(Abundance ~ Group)$`Pr(>F)`[1], error = function(e) NA_real_),
+        .groups = "drop"
+    ) %>%
+    mutate(equal_var = levene_p > 0.05)
+
+# Step 4: IQR similarity between groups
+iqr_results <- proteomics_long %>%
+    group_by(Protein, Group) %>%
+    summarise(IQR = IQR(Abundance), .groups = "drop") %>%
+    pivot_wider(names_from = Group, values_from = IQR) %>%
+    mutate(similar_shape = abs(Low - Medium) / pmax(Low, Medium) < 0.3)
+
+# Step 5: Combine assumption checks
+assumptions_summary <- shapiro_results %>%
+    left_join(levene_results, by = "Protein") %>%
+    left_join(iqr_results, by = "Protein") %>%
+    mutate(
+        use_ttest = normal_Low & normal_Medium & equal_var,
+        use_wilcox = !use_ttest & similar_shape,
+        skip = is.na(use_ttest) & is.na(use_wilcox)
+    )
+
+# View decision summary
+table(
+    t_test = assumptions_summary$use_ttest,
+    wilcox = assumptions_summary$use_wilcox
+)
+```
+
+## Test de Welch, cuando tienes varianzas heterogéneas
+
 ## Running limma
+
 ```{r}
 # Only do this if using raw intensities
 log2_matrix <- log2(intensity_matrix + 1)
@@ -257,7 +314,6 @@ design <- model.matrix(~ 0 + group)
 colnames(design) <- levels(group)
 
 # limma analysis
-library(limma)
 fit <- lmFit(log2_matrix, design)
 contrast_matrix <- makeContrasts(Medium_vs_Low = Medium - Low, levels = design)
 fit2 <- contrasts.fit(fit, contrast_matrix)
@@ -271,6 +327,7 @@ de_results <- topTable(fit2, coef = "Medium_vs_Low", number = Inf, adjust.method
 head(de_results)
 
 ```
+
 # Volcano plot
 
 ```{r}
@@ -335,9 +392,11 @@ p + ggrepel::geom_text_repel(
 )
 
 ```
+
 # Just plot the genes for either the secretome or cell surface, so produce 2 volcanoes
 
 ## ✅ GSEA: Cell Surface Gene Set
+
 ```{r}
 # --- Required Libraries ---
 library(fgsea)
@@ -384,6 +443,7 @@ surface_plot <- plotEnrichment(
   theme_minimal(base_size = 13)
 
 ```
+
 ## ✅ GSEA: Secretome Gene Set
 
 ## Secretome enrichment
@@ -439,7 +499,9 @@ secretome_plot <- plotEnrichment(
 # --- 7. Print plot ---
 print(secretome_plot)
 ```
+
 ## Intrinsic apoptotic GSEA
+
 ```{r}
 # Load required libraries
 library(msigdbr)
@@ -488,6 +550,7 @@ print(intrinsic_plot)
 ```
 
 ## Extrinsic apoptotic GSEA
+
 ```{r}
 # ✅ Define the extrinsic pathway using HGNC gene symbols
 extrinsic_genes <- c(
@@ -525,7 +588,6 @@ extrinsic_plot <- plotEnrichment(
 # ✅ Show plot
 print(extrinsic_plot)
 ```
-
 
 # Mat s plot
 
@@ -622,7 +684,6 @@ print(all_sig_plot)
 
 ```
 
-
 ## ✅ Filter for Secretome genes
 
 ```{r}
@@ -645,6 +706,7 @@ secretome_both_plot <- ggplot(merged_secretome, aes(x = RNA_log2FC, y = MS_log2F
 ```
 
 ## ✅ Filter for Cell Surface genes
+
 ```{r}
 # Get list of cell surface genes from msigdbr
 cell_surface_genes <- gocc_cell_surface[[1]]
@@ -669,11 +731,10 @@ cs_both_plot <- ggplot(merged_cell_surface %>%
   ) +
   theme_minimal(base_size = 14)
 ```
+
 # Make sure I am using -1 and +1 for both datasets, but we do not care about RNAseq significance
- 
+
 #Redo this but putting massspec only signifcant show them in blue, all remaining in gray
-
-
 
 ```{r}
 # ✅ Step 1: Define apoptosis gene sets (by symbol)
@@ -758,13 +819,17 @@ combined_gene_sets_plot <- ggplot() +
 print(combined_gene_sets_plot)
 
 ```
-# * Make this as -12 to +12 and add the other 2 , AVOID YELLOWS
-#* Add the 2 gene sets
-# * Plot the same genes in the NR CR 
 
-#Plot those specific genes to see if its significant or not
-wss2
-Take each cell line and plot the expression for each individual one. 
+## Dividir en dos grupos:
+
+-   Sin outliers
+-   Los outliers
+
+# \* Make this as -12 to +12 and add the other 2 , AVOID YELLOWS
+
+#\* Add the 2 gene sets \# \* Plot the same genes in the NR CR
+
+#Plot those specific genes to see if its significant or not wss2 Take each cell line and plot the expression for each individual one.
 
 ```{r}
 # ✅ Required libraries
@@ -823,8 +888,8 @@ heat_mp <- pheatmap(
 
 ```
 
-
 # Heatmap of CR/NR
+
 ```{r}
 # === Required Libraries ===
 library(tidyverse)
@@ -906,6 +971,7 @@ print(cr_nr_heatmap)
 dev.off()
 
 ```
+
 RIPK1 Expression:
 
 # Raw log2
@@ -937,6 +1003,7 @@ ggplot(ripk1_df_raw, aes(x = Sensitivity, y = Expression, fill = Sensitivity)) +
 ```
 
 ## After QN and scaled
+
 ```{r}
 # ✅ Get expression values of RIPK1 from log2-transformed QN matrix
 ripk1_expr <- log2_qn["RIPK1", ]
@@ -963,6 +1030,461 @@ ggplot(ripk1_df, aes(x = Sensitivity, y = Expression, fill = Sensitivity)) +
   ) +
   theme_minimal(base_size = 13) +
   theme(legend.position = "none")
+
+```
+
+
+
+# distributions of protein intensities by group (Low vs Medium)
+
+```{r}
+# Long format + group annotation
+proteomics_long <- intensity_matrix %>%
+  rownames_to_column("Protein") %>%
+  pivot_longer(-Protein, names_to = "Sample", values_to = "Abundance") %>%
+  left_join(intensity_map %>% dplyr::select(Sample = colname, Group = Sensitivity.group), by = "Sample") %>%
+  filter(!is.na(Group))  # Just in case
+```
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(e1071)
+library(stringr)
+
+# 🧠 Step 1: Extract short sample names from 'colname' (lowercase + padded → uppercase no padding)
+intensity_map_fixed <- intensity_map %>%
+  mutate(Sample = str_extract(colname, "iv\\d+"),
+         Sample = toupper(str_replace(Sample, "^IV0", "IV")))  # iv01 → IV1
+
+# ✅ Inspect sample name alignment
+cat("Sample names in intensity_matrix:\n")
+print(colnames(intensity_matrix))
+cat("\nSample names in intensity_map_fixed:\n")
+print(intensity_map_fixed$Sample)
+
+# 🔄 Step 2: Convert intensity_matrix to long format
+proteomics_long_fmt <- intensity_matrix %>%
+  as.data.frame() %>%
+  rownames_to_column("Protein") %>%
+  pivot_longer(-Protein, names_to = "Sample", values_to = "Abundance")
+
+# 🧬 Step 3: Join with group info and compute log-abundance
+proteomics_long_fmt <- proteomics_long_fmt %>%
+  left_join(intensity_map_fixed %>% dplyr::select(Sample, Group = Sensitivity.group), by = "Sample") %>%
+  filter(!is.na(Group)) %>%
+  mutate(log_abund = log1p(Abundance))
+
+# ✅ Confirm successful join
+cat("\nPreview of long-format joined data:\n")
+print(head(proteomics_long_fmt, 10))
+cat("\nUnique groups:\n")
+print(unique(proteomics_long_fmt$Group))
+
+# 📊 Step 4: Compute group-wise stats
+if (nrow(proteomics_long_fmt) > 0) {
+  group_summary_stats_fmt <- proteomics_long_fmt %>%
+    group_by(Group) %>%
+    summarise(
+      n = n(),
+      n_zeros = sum(Abundance == 0),
+      prop_zero = mean(Abundance == 0),
+      mean_raw = mean(Abundance),
+      sd_raw = sd(Abundance),
+      skew_raw = e1071::skewness(Abundance),
+      mean_log = mean(log_abund),
+      sd_log = sd(log_abund),
+      skew_log = e1071::skewness(log_abund),
+      .groups = "drop"
+    )
+
+  cat("\n✅ Group-level summary statistics:\n")
+  print(group_summary_stats_fmt)
+} else {
+  cat("\n⚠️ No data available after join. Still failing — sample names may not match.\n")
+}
+
+
+```
+
+# Visualizing
+```{r}
+# 📦 Required libraries
+library(ggplot2)
+
+# 🔍 Density plots of raw abundance
+ggplot(proteomics_long_fmt, aes(x = Abundance, fill = Group)) +
+  geom_density(alpha = 0.4) +
+  scale_x_log10() +
+  labs(title = "Density Plot of Raw Abundance (log10-scaled)", x = "Abundance", y = "Density") +
+  theme_minimal()
+
+# 🔍 Density plots of log-transformed abundance
+ggplot(proteomics_long_fmt, aes(x = log_abund, fill = Group)) +
+  geom_density(alpha = 0.4) +
+  labs(title = "Density Plot of log(Abundance + 1)", x = "log(Abundance + 1)", y = "Density") +
+  theme_minimal()
+
+# 📦 Boxplot of log-transformed abundance
+ggplot(proteomics_long_fmt, aes(x = Group, y = log_abund, fill = Group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(width = 0.15, size = 0.5, alpha = 0.2) +
+  labs(title = "Boxplot of log(Abundance + 1)", y = "log(Abundance + 1)", x = "Group") +
+  theme_minimal()
+
+```
+
+# 🧮 2. Check Assumptions (Levene’s test + Distribution fit checks)
+
+```{r}
+# 📦 Required libraries
+library(car)      # For Levene’s Test
+library(fitdistrplus)  # For distribution fitting
+
+# 🔎 Levene's Test for variance equality on log-abundance
+leveneTest(log_abund ~ Group, data = proteomics_long_fmt)
+
+# 📦 OPTIONAL: Fit distributions to one group only (e.g., Low)
+log_vals_low <- proteomics_long_fmt$log_abund[proteomics_long_fmt$Group == "Low"]
+
+# Fit to log-normal
+fit_ln <- fitdist(log_vals_low, "norm")
+
+# Fit to gamma
+gamma_vals_low <- proteomics_long_fmt$Abundance[proteomics_long_fmt$Group == "Low"]
+fit_gamma <- fitdist(gamma_vals_low[gamma_vals_low > 0], "gamma")  # Remove zeros
+
+# Plot fit diagnostics
+par(mfrow = c(2, 2))
+plot(fit_ln)
+plot(fit_gamma)
+
+```
+
+
+
+# Doing DEqMS
+
+## 🔹 1. Data Input and Transformation
+Goal: Load protein intensities and prepare spectral counts per gene.
+
+```{r}
+# Load required libraries
+library(readxl)
+library(dplyr)
+library(stringr)
+library(DEqMS)
+library(limma)
+library(matrixStats)
+
+# Load expression matrix (already log2-transformed here)
+gene.matrix <- log2(intensity_matrix + 1)
+
+# Read peptide-level table with spectral counts
+peptide_file <- readxl::read_xlsx("MatthewWitkowski_4574840_CombinedModifiedPeptide.xlsx", col_names = TRUE)
+
+# Identify Spectral Count columns (avoid "Unique" and "Intensity")
+spectral_cols <- grep("Spectral Count$", names(peptide_file), value = TRUE)
+spectral_cols <- spectral_cols[!grepl("Unique|Intensity", spectral_cols)]
+
+# Ensure numeric type
+peptide_file[spectral_cols] <- lapply(peptide_file[spectral_cols], as.numeric)
+```
+
+## 🔹 2. PSM Count Aggregation
+Goal: Aggregate spectral counts per gene (min total per gene), align with intensity matrix.
+```{r}
+# Compute minimum total PSM count per gene
+psm.count.table <- peptide_file %>%
+  filter(!is.na(Gene)) %>%
+  group_by(Gene) %>%
+  summarise(count = min(rowSums(across(all_of(spectral_cols)), na.rm = TRUE)), .groups = "drop") %>%
+  as.data.frame()
+
+# Convert to named row format
+rownames(psm.count.table) <- psm.count.table$Gene
+psm.count.table$Gene <- NULL
+
+# Align to expression matrix
+psm.count.table <- psm.count.table[rownames(gene.matrix), , drop = FALSE]
+
+# Add pseudocount (+1) to avoid zeros
+psm.count.table$count <- psm.count.table$count + 1
+```
+
+##🔹 3. Model Design and Linear Fit (Limma)
+Goal: Fit a linear model to the protein-level expression data (gene.matrix) to estimate log2 fold changes between groups (Medium vs Low) before DEqMS correction.
+
+
+```{r}
+# Remove duplicated genes
+dups <- duplicated(rownames(gene.matrix))
+if (any(dups)) {
+  gene.matrix <- gene.matrix[!dups, , drop = FALSE]
+}
+
+# Define group and design matrix
+group <- factor(intensity_map$Sensitivity.group, levels = c("Low", "Medium"))
+design <- model.matrix(~0 + group)
+colnames(design) <- levels(group)
+
+# Fit limma model and contrast
+fit1 <- lmFit(gene.matrix, design)
+contrast <- makeContrasts(Medium - Low, levels = design)
+fit2 <- contrasts.fit(fit1, contrast)
+fit2 <- eBayes(fit2)
+```
+
+## 🔹 4. Prepare for DEqMS and Run
+Goal: Attach count data to the limma fit and run DEqMS variance shrinkage.
+
+```{r}
+# Attach spectral count to limma model
+fit2$count <- psm.count.table[rownames(fit2$coefficients), "count"]
+valid_rows <- !is.na(fit2$count)
+
+# Clean invalid rows in all fit2 components
+# Filter all components of fit2 using valid row index
+fit2_filtered <- lapply(fit2, function(comp) {
+  if (is.matrix(comp) || is.data.frame(comp)) {
+    if (nrow(comp) == length(valid_rows)) return(comp[valid_rows, , drop = FALSE])
+  } else if (length(comp) == length(valid_rows)) {
+    return(comp[valid_rows])
+  }
+  return(comp)
+})
+class(fit2_filtered) <- "MArrayLM"
+
+```
+
+Because proteins quantified with more PSMs provide more precise estimates, DEqMS models the relationship between variance and PSM count, and applies a Bayesian shrinkage adjustment that depends on this count. The idea is: low-PSM proteins get more shrinkage, high-PSM proteins get less.
+
+```{r}
+# Run DEqMS
+fit3 <- spectraCounteBayes(fit2_filtered)
+```
+
+---
+
+# ✅ Extract + Compare Results
+
+```{r}
+DEqMS.results <- outputResult(fit3, coef_col = 1)
+
+head(DEqMS.results)
+
+```
+
+
+
+```{r}
+# 3.1.1 Prior variance comparison
+VarianceScatterplot(fit3, xlab = "log2(PSM count)")
+limma.prior <- fit3$s2.prior
+abline(h = log(limma.prior), col = "green", lwd = 3)
+legend("topright",
+       legend = c("DEqMS prior variance", "Limma prior variance"),
+       col = c("red", "green"), lwd = 3)
+
+```
+
+
+```{r}
+# Residual plot: DEqMS vs Limma
+op <- par(mfrow = c(1, 2), mar = c(4, 4, 4, 1), oma = c(0.5, 0.5, 0.5, 0))
+
+# DEqMS residuals
+Residualplot(fit3, xlab = "log2(PSM count)", main = "DEqMS")
+
+# Limma residuals (based on deviation from prior)
+x <- fit3$count
+y <- log(fit3$s2.prior) - log(fit3$sigma^2)
+plot(log2(x), y, ylim = c(-6, 2),
+     ylab = "Variance (estimated - observed)",
+     xlab = "log2(PSM count)",
+     main = "Limma", pch = 20, cex = 0.5)
+
+```
+
+
+```{r}
+# Load LSD if needed
+library(LSD)
+
+# Compare shrinkage of posterior variance
+op <- par(mfrow = c(1, 2), mar = c(4, 4, 4, 1), oma = c(0.5, 0.5, 0.5, 0))
+
+# Limma posterior variance
+heatscatter(log2(fit3$count), log(fit3$s2.post),
+            pch = 20, xlab = "log2(PSM count)",
+            ylab = "log(Posterior Variance)",
+            main = "Posterior Variance in Limma")
+
+# DEqMS posterior variance
+heatscatter(log2(fit3$count), log(fit3$sca.postvar),
+            pch = 20, xlab = "log2(PSM count)",
+            ylab = "log(Posterior Variance)",
+            main = "Posterior Variance in DEqMS")
+
+```
+
+```{r}
+# Replace these indices with your sample columns for Low and Medium groups
+low_idx <- which(intensity_map$Sensitivity.group == "Low")
+med_idx <- which(intensity_map$Sensitivity.group == "Medium")
+
+pval.ttest <- apply(gene.matrix, 1, function(x)
+  t.test(as.numeric(x[low_idx]), as.numeric(x[med_idx]))$p.value)
+
+logFC.ttest <- rowMeans(gene.matrix[, med_idx]) - rowMeans(gene.matrix[, low_idx])
+
+ttest.results <- data.frame(
+  gene = rownames(gene.matrix),
+  logFC = logFC.ttest,
+  P.Value = pval.ttest,
+  adj.pval = p.adjust(pval.ttest, method = "BH")
+)
+
+ttest.results$PSMcount <- psm.count.table[ttest.results$gene, "count"]
+ttest.results <- ttest.results[order(ttest.results$P.Value), ]
+
+```
+
+```{r}
+ord.t <- fit1$coefficients[, 1] / fit1$sigma / fit1$stdev.unscaled[, 1]
+ord.p <- 2 * pt(abs(ord.t), df = fit1$df.residual, lower.tail = FALSE)
+ord.q <- p.adjust(ord.p, method = "BH")
+
+anova.results <- data.frame(
+  gene = rownames(fit1$coefficients),
+  logFC = fit1$coefficients[, 1],
+  t = ord.t,
+  P.Value = ord.p,
+  adj.P.Val = ord.q,
+  PSMcount = psm.count.table[rownames(fit1$coefficients), "count"]
+)
+
+anova.results <- anova.results[order(anova.results$P.Value), ]
+
+```
+
+```{r}
+limma.results <- topTable(fit2, coef = 1, n = Inf)
+limma.results$gene <- rownames(limma.results)
+limma.results$PSMcount <- psm.count.table[limma.results$gene, "count"]
+
+```
+
+
+```{r}
+# Set up side-by-side layout
+par(mfrow = c(1, 2), mar = c(5, 5, 4, 2))
+
+# Plot 1: All proteins
+plot(sort(-log10(limma.results$P.Value), decreasing = TRUE),
+     type = "l", lty = 2, lwd = 2, ylab = "-log10(p-value)", ylim = c(0, 10),
+     xlab = "All proteins ranked by p-value", col = "purple",
+     main = "All Proteins")
+
+lines(sort(-log10(DEqMS.results$sca.P.Value), decreasing = TRUE),
+      lty = 1, lwd = 2, col = "red")
+lines(sort(-log10(anova.results$P.Value), decreasing = TRUE),
+      lty = 2, lwd = 2, col = "blue")
+lines(sort(-log10(ttest.results$P.Value), decreasing = TRUE),
+      lty = 2, lwd = 2, col = "orange")
+
+legend("topright", legend = c("Limma", "DEqMS", "Anova", "t-test"),
+       col = c("purple", "red", "blue", "orange"), lty = c(2, 1, 2, 2), lwd = 2, cex = 0.8)
+
+# Plot 2: Top 500 proteins
+plot(sort(-log10(limma.results$P.Value), decreasing = TRUE)[1:10],
+     type = "l", lty = 2, lwd = 2, ylab = "-log10(p-value)", ylim = c(2, 10),
+     xlab = "Top 500 proteins", col = "purple",
+     main = "Top 500 Proteins")
+
+lines(sort(-log10(DEqMS.results$sca.P.Value), decreasing = TRUE)[1:10],
+      lty = 1, lwd = 2, col = "red")
+lines(sort(-log10(anova.results$P.Value), decreasing = TRUE)[1:10],
+      lty = 2, lwd = 2, col = "blue")
+lines(sort(-log10(ttest.results$P.Value), decreasing = TRUE)[1:10],
+      lty = 2, lwd = 2, col = "orange")
+
+legend("topright", legend = c("Limma", "DEqMS", "Anova", "t-test"),
+       col = c("purple", "red", "blue", "orange"), lty = c(2, 1, 2, 2), lwd = 2, cex = 0.8)
+
+```
+
+
+```{r}
+# Load libraries
+library(ggplot2)
+library(dplyr)
+library(ggrepel)
+
+# 🔧 Define thresholds
+fc_cutoff <- 1
+pval_cutoff <- 0.05
+
+# 🎯 Prepare volcano data
+volcano_data <- DEqMS.results %>%
+  dplyr::select(
+    GeneSymbol = gene,
+    log2FC = logFC,
+    PValue = sca.P.Value
+  ) %>%
+  filter(!is.na(log2FC), !is.na(PValue)) %>%
+  mutate(
+    GeneType = case_when(
+      log2FC >= fc_cutoff & PValue <= pval_cutoff ~ "up",
+      log2FC <= -fc_cutoff & PValue <= pval_cutoff ~ "down",
+      TRUE ~ "ns"
+    )
+  )
+
+# 🎨 Color and size aesthetics
+cols <- c("up" = "#ffad73", "down" = "#26b3ff", "ns" = "gray80")
+sizes <- c("up" = 2, "down" = 2, "ns" = 1)
+alphas <- c("up" = 1, "down" = 1, "ns" = 0.5)
+
+# 📊 Volcano plot
+p <- ggplot(volcano_data, aes(
+  x = log2FC,
+  y = -log10(PValue),
+  fill = GeneType,
+  size = GeneType,
+  alpha = GeneType
+)) +
+  geom_point(shape = 21, color = "black") +
+  geom_hline(yintercept = -log10(pval_cutoff), linetype = "dashed", color = "gray40") +
+  geom_vline(xintercept = c(-fc_cutoff, fc_cutoff), linetype = "dashed", color = "gray40") +
+  scale_fill_manual(values = cols, name = "Regulation") +
+  scale_size_manual(values = sizes, guide = "none") +
+  scale_alpha_manual(values = alphas, guide = "none") +
+  labs(
+    title = "Volcano Plot (DEqMS P-values)",
+    subtitle = "Threshold: |log2FC| ≥ 1 & p-value ≤ 0.05",
+    x = "log2(Fold Change) (Medium / Low)",
+    y = "-log10(DEqMS P-value)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    legend.position = "right"
+  )
+
+# 🧬 Add gene labels for significant hits
+p + geom_text_repel(
+  data = filter(volcano_data, GeneType != "ns"),
+  aes(label = GeneSymbol),
+  size = 3,
+  color = "black",
+  max.overlaps = 12,
+  box.padding = 0.4,
+  point.padding = 0.3,
+  segment.size = 0.3
+)
 
 ```
 
